@@ -17,8 +17,9 @@ Measured on a Jetson Orin (GNOME 42 Wayland, 3840x2160, nvidia-drm):
 
 | Operation | Time |
 |---|---|
-| scanout grab with cursor | 20-36 ms |
-| resize + PNG to 1920 px | 130-160 ms |
+| scanout grab with cursor, BGRX to RGBA | 13-20 ms |
+| box downscale 4K to 1080p + PNG | 15-17 ms |
+| same to 1280x720 | 8-11 ms |
 | screen recording | 1080p at 15 fps, hardware H.264, zero dropped frames |
 
 Why this route and not the others: [docs/prior-art.md](docs/prior-art.md).
@@ -70,7 +71,11 @@ docs/          prior art, vendor tool shapes
 **Capture.** `drmtap_grab_mapped` returns the current scanout as tightly packed BGRX (EGL
 detiles block-linear buffers on NVIDIA). The hardware cursor lives on its own KMS plane,
 so it is read separately and composited with premultiplied alpha. Frames are cropped and
-resized in-process and encoded to PNG or JPEG.
+downscaled in-process by an integer box filter (rows split across cores) and encoded to
+PNG (fast zlib level, Sub filter, about 1 MB for a 1080p desktop) or JPEG. `max_side` is
+an upper bound: 3840 becomes 1920 for 1920, 1280 for 1568. The `image` crate's resampler
+was measured at 134 ms for the same 4K to 1080p step (84 ms even for nearest), against
+22 ms for the box filter single-threaded and about 5 ms across 12 cores.
 
 **Input.** The pointer is a uinput device with `ABS_X`/`ABS_Y` whose range equals the
 union of the active displays, so `ABS(x, y)` lands on scanout pixel `(x, y)`, the same

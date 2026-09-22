@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageEncoder, RgbaImage};
+use image::{codecs::jpeg::JpegEncoder, ImageEncoder, RgbaImage};
 use kmscua_proto::{CursorInfo, DisplayInfo, ImageFormat, Rect, ScreenshotInfo};
 use libdrmtap::{Config, DrmTap};
 
@@ -227,15 +227,15 @@ impl Capturer {
         let shot = self.grab(with_cursor, region)?;
         let t0 = Instant::now();
         let (sw, sh) = shot.rgba.dimensions();
+        // Integer-factor box downscale, rows split across cores. The image
+        // crate's resampler costs 134 ms for 4K->1080p on the Orin (84 ms even
+        // for Nearest); this is ~22 ms single-threaded and ~5 ms on 12 cores.
+        // `max_side` is therefore an upper bound: 3840 -> 1920 (factor 2),
+        // 1568 -> 1280 (factor 3).
         let (img, scale) = match max_side {
             Some(m) if m > 0 && (sw > m || sh > m) => {
-                let s = (sw.max(sh) as f32) / m as f32;
-                let nw = ((sw as f32 / s).round() as u32).max(1);
-                let nh = ((sh as f32 / s).round() as u32).max(1);
-                (
-                    image::imageops::resize(&shot.rgba, nw, nh, FilterType::Triangle),
-                    s,
-                )
+                let factor = plan_factor(sw.max(sh), m);
+                (downscale_box(&shot.rgba, factor), factor as f32)
             }
             _ => (shot.rgba, 1.0),
         };
@@ -273,6 +273,60 @@ impl Capturer {
         };
         Ok((info, buf))
     }
+}
+
+/// Smallest integer factor that brings `longest` to at most `max_side`.
+pub fn plan_factor(longest: u32, max_side: u32) -> u32 {
+    let mut f = 1;
+    while longest / f > max_side.max(16) {
+        f += 1;
+    }
+    f
+}
+
+/// Box (area-average) downscale by an integer factor, parallel over rows.
+pub fn downscale_box(src: &RgbaImage, factor: u32) -> RgbaImage {
+    if factor <= 1 {
+        return src.clone();
+    }
+    let (sw, sh) = src.dimensions();
+    let (dw, dh) = ((sw / factor).max(1), (sh / factor).max(1));
+    let s = src.as_raw();
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    let n = factor * factor;
+    let half = n / 2;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(dh as usize).max(1);
+    let rows_per = (dh as usize + threads - 1) / threads;
+    std::thread::scope(|sc| {
+        for (ti, chunk) in out.chunks_mut(rows_per * dw as usize * 4).enumerate() {
+            let y0 = (ti * rows_per) as u32;
+            sc.spawn(move || {
+                let rows = chunk.len() / (dw as usize * 4);
+                for ry in 0..rows as u32 {
+                    let y = y0 + ry;
+                    for x in 0..dw {
+                        let mut acc = [0u32; 3];
+                        for dy in 0..factor {
+                            let row = ((y * factor + dy) * sw) as usize * 4;
+                            let mut i = row + (x * factor) as usize * 4;
+                            for _ in 0..factor {
+                                acc[0] += s[i] as u32;
+                                acc[1] += s[i + 1] as u32;
+                                acc[2] += s[i + 2] as u32;
+                                i += 4;
+                            }
+                        }
+                        let o = ((ry * dw + x) * 4) as usize;
+                        chunk[o] = ((acc[0] + half) / n) as u8;
+                        chunk[o + 1] = ((acc[1] + half) / n) as u8;
+                        chunk[o + 2] = ((acc[2] + half) / n) as u8;
+                        chunk[o + 3] = 255;
+                    }
+                }
+            });
+        }
+    });
+    RgbaImage::from_raw(dw, dh, out).expect("sized buffer")
 }
 
 fn clamp_rect(r: Rect, fw: u32, fh: u32) -> Option<Rect> {

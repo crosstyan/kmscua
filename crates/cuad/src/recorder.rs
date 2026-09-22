@@ -335,38 +335,9 @@ impl Recorder {
     }
 }
 
-/// Integer box downscale by `factor` (average of factor x factor blocks).
+/// Integer box downscale, shared with screenshots.
 pub fn downscale(src: &RgbaImage, factor: u32) -> RgbaImage {
-    if factor <= 1 {
-        return src.clone();
-    }
-    let (sw, sh) = src.dimensions();
-    let (dw, dh) = (sw / factor, sh / factor);
-    let mut dst = RgbaImage::new(dw, dh);
-    let s = src.as_raw();
-    let d = dst.as_mut();
-    let n = (factor * factor) as u32;
-    let half = n / 2;
-    for y in 0..dh {
-        for x in 0..dw {
-            let mut acc = [0u32; 3];
-            for dy in 0..factor {
-                let row = ((y * factor + dy) * sw) as usize * 4;
-                for dx in 0..factor {
-                    let i = row + ((x * factor + dx) as usize) * 4;
-                    acc[0] += s[i] as u32;
-                    acc[1] += s[i + 1] as u32;
-                    acc[2] += s[i + 2] as u32;
-                }
-            }
-            let o = ((y * dw + x) * 4) as usize;
-            d[o] = ((acc[0] + half) / n) as u8;
-            d[o + 1] = ((acc[1] + half) / n) as u8;
-            d[o + 2] = ((acc[2] + half) / n) as u8;
-            d[o + 3] = 255;
-        }
-    }
-    dst
+    crate::capture::downscale_box(src, factor)
 }
 
 /// Choose the integer factor so the longest side fits `max_side`, and the

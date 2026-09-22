@@ -62,7 +62,9 @@ pub enum Request {
     Displays,
     /// One frame of the scanout with the hardware cursor composited in.
     Screenshot {
-        /// Longest side of the returned image, in pixels. None = native.
+        /// Upper bound on the longest side of the returned image. The
+        /// daemon downscales by an integer factor, so 3840 -> 1920 for 1920
+        /// and 3840 -> 1280 for 1568. None = native.
         #[serde(default)]
         max_side: Option<u32>,
         #[serde(default)]
