@@ -33,7 +33,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::video;
+use crate::{atspi, video};
 
 /// Default longest side of a screenshot. 1080p is Anthropic's documented
 /// balance of accuracy and cost; the models accept up to 2576 px.
@@ -60,6 +60,7 @@ pub struct CuaServer {
     view: Arc<Mutex<View>>,
     rec: Arc<Mutex<Option<RecState>>>,
     last_rec: Arc<Mutex<Option<PathBuf>>>,
+    ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
     max_side: u32,
     tool_router: ToolRouter<Self>,
 }
@@ -634,6 +635,7 @@ impl CuaServer {
             view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0 })),
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
+            ui: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
             tool_router: Self::tool_router(),
         }
@@ -1014,6 +1016,25 @@ impl CuaServer {
             content.push(Content::image(base64::engine::general_purpose::STANDARD.encode(&png), "image/png"));
         }
         Ok(CallToolResult::success(content))
+    }
+
+    #[tool(
+        name = "get_focused",
+        description = "Read, through the accessibility bus, which application and window are active and what element has keyboard focus: its role, name, states, the exact text it holds and the caret position. Use it instead of zoom when you need text verbatim (a path, a number, what you just typed). Coverage depends on the app: GTK, Qt, terminals and Electron with accessibility on answer well; Flutter, GL canvases, video and games expose little or nothing, so a thin answer means the app is silent, not that the field is empty. Trust the screenshot when they disagree. Nothing here changes the screen."
+    )]
+    async fn get_focused(&self) -> Result<CallToolResult, ErrorData> {
+        let mut ui = self.ui.lock().await;
+        if ui.is_none() {
+            *ui = Some(atspi::Ui::connect().await.map_err(err)?);
+        }
+        let text = match ui.as_ref().unwrap().get_focused().await {
+            Ok(t) => t,
+            Err(e) => {
+                *ui = None;
+                return Err(err(e));
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(name = "doctor", description = "Report whether capture, input, clipboard paste and recording are available and why not.")]

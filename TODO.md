@@ -4,13 +4,16 @@ Ordered by value. Estimates are for one person who knows the codebase.
 
 ## Codex profile (app-scoped, accessibility-first) — about 2 days
 
-Not started. The wire shapes are in [docs/vendor-tool-shapes.md](docs/vendor-tool-shapes.md)
-section 3; nothing below needs more research.
+Not started, on purpose: current vision models do not need the tree and are not trained
+on it (see the README's "Not yet"). Build it only for a model that is. The wire shapes
+are in [docs/vendor-tool-shapes.md](docs/vendor-tool-shapes.md) section 3; nothing below
+needs more research. `crates/cua/src/atspi.rs` already has the connection, the app and
+window listing, the cached tree walk and the focused-node search.
 
-1. AT-SPI layer in `cua` (`atspi` crate, session bus from `session.rs`): list
-   applications, snapshot a window's tree with a node budget, `do_action`, `EditableText`
-   set/insert, `Text` selection, `Component` extents in scanout pixels. About a day. The
-   MIT `atspi_tree.rs` in agent-sh/computer-use-linux is a good reference.
+1. Tree snapshot with a node budget, `do_action`, `EditableText` set/insert, `Text`
+   selection, `Component` extents (window-relative on Wayland; scanout mapping needs the
+   window origin, which needs the compositor). About half a day on top of `atspi.rs`.
+   The MIT `atspi_tree.rs` in agent-sh/computer-use-linux is a good reference.
 2. Text renderer for the Codex tree grammar (`<index> <role> (<states>) <title>, Value:…,
    Secondary Actions:…`, four-space indent, `The focused UI element is N …`), with the
    diff mode and `disableDiff`.
@@ -26,7 +29,7 @@ section 3; nothing below needs more research.
 
 - `request_access {apps, reason}` / `list_granted_applications` / `open_application`:
   an allowlist of app names checked against the focused AT-SPI application before
-  mutating actions, with the vendor error text. Needs the AT-SPI layer.
+  mutating actions, with the vendor error text. `atspi.rs` already knows the active app.
 - `read_clipboard` / `write_clipboard` via `wl-paste`/`wl-copy` (already used for
   non-ASCII typing).
 - `switch_display` once multi-CRTC capture exists.

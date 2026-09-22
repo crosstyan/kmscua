@@ -20,7 +20,7 @@ cannot click.
 | `gnome-screenshot -f` | Works, only because its bus name is on the allowlist. GNOME 49 [removed that exception](https://extensions.gnome.org/extension/9127/allow-gnome-screenshot/). |
 | Portal [RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) + [ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html) | Works, but re-prompts every process start: `restore_token` for RemoteDesktop needs xdg-desktop-portal 1.18 and [xdg-desktop-portal-gnome 45](https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/NEWS). ScreenCast-only restore exists since [1.12](https://github.com/flatpak/xdg-desktop-portal/pull/638) / GNOME 42. |
 | `org.gnome.Mutter.RemoteDesktop` + `org.gnome.Mutter.ScreenCast` (the private API [gnome-remote-desktop](https://gitlab.gnome.org/GNOME/gnome-remote-desktop) uses) | Works with no dialog from any same-uid process: full 3840x2160 frame via PipeWire, pointer and keyboard injection in the same pixel space. Confirmed on Shell 50 by [deskwright](https://github.com/tristanmuzzu/deskwright). Rejected for kmscua because it is a private API that any release can close, and GNOME-only. |
-| [AT-SPI2](https://www.freedesktop.org/wiki/Accessibility/AT-SPI2/) | Works for GTK, Qt, Flutter; Electron needs `--force-renderer-accessibility`; GL canvases and video expose nothing. |
+| [AT-SPI2](https://www.freedesktop.org/wiki/Accessibility/AT-SPI2/) | Works for GTK, Qt, VTE; Flutter exposes a one-node shell; Electron needs `--force-renderer-accessibility`; GL canvases and video expose nothing. `Cache.GetItems` (one round trip for a whole tree) exists on GTK and gnome-shell, not on Flutter. Extents on Wayland are window-relative logical pixels. Used for `get_focused` only. |
 | DRM/KMS scanout via [libdrmtap](https://github.com/fxd0h/libdrmtap) + uinput | Works, no compositor involved, works on the lock screen and the GDM greeter. This is the [RustDesk unattended-Wayland](https://github.com/rustdesk/rustdesk/discussions/15417) mechanism. Chosen. |
 
 The last row needed three things upstream did not provide on Tegra: an `aarch64` build, an
@@ -90,6 +90,17 @@ No vendor ships native Linux GUI control as of 2026-09:
 ([Linux issue open](https://github.com/openai/codex/issues/42846)), Anthropic's
 [Claude Desktop Linux beta](https://support.claude.com/en/articles/10065433-install-claude-desktop)
 excludes computer use, and Cursor's Linux app runs the GUI in the cloud.
+
+## Why only `get_focused` from AT-SPI
+
+In the [OSWorld](https://arxiv.org/html/2404.07972v2) paper (2024) the accessibility
+tree more than doubled GPT-4V's success rate over screenshots (12.2% vs 5.3%). By 2026
+pixel-only agents score 60-70% on OSWorld-Verified and the leading entries do not read the
+tree. What pixels still miss is narrow: verbatim text (paths, numbers, what was just
+typed), caret position, and which app owns the active window. That is one read-only
+call, ~150-300 ms on this machine, so that is the tool. The tree as an action space is
+skipped: Claude is trained on pixels, Codex on the macOS AX grammar, and a Linux AT-SPI
+tree is a dialect neither has seen.
 
 ## Agent-facing recording: what works elsewhere
 

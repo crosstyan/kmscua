@@ -135,6 +135,7 @@ intact. Every mutating action also accepts `settle: true` to append the settled 
 | `record_stop {sheet, tiles}` | manifest + numbered timeline + contact sheet |
 | `record_frames {path, at[], every, scene, between[i,j], max, max_side}` | stills with timestamps |
 | `record_status`, `doctor` | text |
+| `get_focused` | active app, window title, focused element with its exact text and caret (AT-SPI, read-only) |
 
 The model never receives a video. It gets a manifest, stills, and a timeline, which is
 what Playwright traces, browser-use, Cua and the GUI-agent papers converge on. The
@@ -164,11 +165,14 @@ control recording.
 
 ## Limitations
 
-- **Pixels only, no window metadata.** kmscua does not know which windows exist, which
-  one has focus, or where they are. Input goes to whatever the compositor thinks is
-  focused, screenshots are the whole scanout, and there is no per-window crop or app
-  scoping. That is what the AT-SPI layer in [TODO.md](TODO.md) adds; until then the
-  model works the way a human at the monitor does.
+- **Pixels first, almost no window metadata.** kmscua does not know where windows are.
+  Input goes to whatever the compositor thinks is focused, screenshots are the whole
+  scanout, and there is no per-window crop or app scoping. The one exception is
+  `get_focused`, which asks AT-SPI for the active app, the window title and the focused
+  element's exact text: enough to verify what was typed without a `zoom`, not an
+  element tree. GTK, Qt and VTE answer well, Electron needs its accessibility flag,
+  Flutter, GL and video answer with nothing useful. AT-SPI positions on Wayland are
+  window-relative and cannot be mapped to the screenshot, so they are not reported.
 - **X11 is not the target.** It works there too (the scanout is below X), but X11 already
   has `xdotool`, `xwd`, `wmctrl` and XTEST with window awareness; kmscua brings nothing
   they lack. Use it on X11 only if you want one tool across both.
@@ -197,8 +201,10 @@ control recording.
 ## Not yet
 
 See [TODO.md](TODO.md). The big one is the Codex profile (app-scoped, accessibility-first,
-`get_app_state` with a numbered AT-SPI tree), which is fully specified and waits on the
-AT-SPI layer.
+`get_app_state` with a numbered AT-SPI tree). It is fully specified and deliberately not
+built: Claude models are trained on pixels, Codex on the macOS AX grammar, so a Linux
+tree is a reading aid for the one and an unfamiliar dialect for the other. `get_focused`
+is the reading aid; the tree waits for a model that is trained on it.
 
 ## License
 

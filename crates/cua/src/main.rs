@@ -5,6 +5,7 @@
 //! session (clipboard paste for non-ASCII text, AT-SPI later) finds the
 //! session environment itself, so it also works from an SSH shell.
 
+mod atspi;
 mod mcp;
 mod session;
 mod video;
@@ -87,6 +88,8 @@ enum Cmd {
     Type { text: String },
     /// Wake a blanked display.
     Wake,
+    /// Which app, window and element have focus, with the element's text (AT-SPI).
+    Focused,
     /// Screen recording (H.264 MP4, hardware encoder when available).
     #[command(subcommand)]
     Record(RecordCmd),
@@ -268,6 +271,12 @@ fn main() -> Result<()> {
             .map(|_| ()),
         Cmd::Type { text } => type_text(&c, text),
         Cmd::Wake => c.call(&Request::Wake).map(|_| ()),
+        Cmd::Focused => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let text = rt.block_on(async { atspi::Ui::connect().await?.get_focused().await })?;
+            print!("{text}");
+            Ok(())
+        }
         Cmd::Record(rc) => record_cmd(&c, rc),
         Cmd::Mcp { max_side } => {
             let rt = tokio::runtime::Runtime::new()?;
