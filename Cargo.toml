@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/proto", "crates/cuad", "crates/cua"]
+members = ["crates/proto", "crates/libdrmtap-sys", "crates/libdrmtap", "crates/cuad", "crates/cua"]
 resolver = "2"
 
 [workspace.package]

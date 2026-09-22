@@ -5,6 +5,7 @@ set -eu
 here="$(cd "$(dirname "$0")/.." && pwd)"
 user="${1:-${SUDO_USER:-$(id -un)}}"
 
+git -C "$here" submodule update --init
 cargo build --release --manifest-path "$here/Cargo.toml"
 
 sudo install -m755 "$here/target/release/cuad" /usr/local/bin/cuad

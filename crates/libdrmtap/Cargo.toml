@@ -1,0 +1,9 @@
+[package]
+name = "libdrmtap"
+version = "0.5.4"
+edition = "2021"
+license = "MIT"
+description = "Safe wrapper for libdrmtap, sourced from the git submodule"
+
+[dependencies]
+libdrmtap-sys = { path = "../libdrmtap-sys" }

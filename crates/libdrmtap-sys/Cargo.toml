@@ -1,0 +1,11 @@
+[package]
+name = "libdrmtap-sys"
+version = "0.5.4"
+edition = "2021"
+license = "MIT"
+description = "FFI bindings for libdrmtap, built from the git submodule with kmscua's patches applied"
+links = "drmtap"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
