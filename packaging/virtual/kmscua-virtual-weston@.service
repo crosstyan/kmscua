@@ -1,0 +1,21 @@
+[Unit]
+Description=kmscua virtual desktop: weston on vkms for %i
+Documentation=https://github.com/crosstyan/kmscua
+After=systemd-udevd.service systemd-modules-load.service
+# The socket lives at /run/kmscua-virtual/wayland/wayland-0; clients set
+# WAYLAND_DISPLAY to that absolute path.
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=kmscua video
+ExecStartPre=+/sbin/modprobe vkms
+ExecStart=/usr/local/bin/kmscua-weston.sh
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=kmscua-virtual/wayland
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/kmscua-virtual/wayland
+
+[Install]
+WantedBy=multi-user.target

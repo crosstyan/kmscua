@@ -46,6 +46,17 @@ window listing, the cached tree walk and the focused-node search.
   off by the cursor's hotspot (6-14 px scanout). Either read the hotspot from the DRM
   plane properties where the driver exposes them, or report the last injected position.
 
+## Virtual desktop
+
+- Cursor plane on vkms: libdrmtap reports no cursor there; read the cursor plane's
+  shmem buffer so `cursor_position` works on the virtual desktop too.
+- Xwayland: package a weston build with the xwayland module, or support another
+  DRM-backend compositor (sway, labwc) in `kmscua-weston.sh`.
+- Separate session bus for the virtual desktop so `get_focused` and the clipboard
+  target weston's apps, not the seat0 session.
+- Fold the second daemon into one `cuad` serving several cards (one socket, a
+  `display` selector), which `switch_display` in the Claude Code parity list wants.
+
 ## Input
 
 - xkb-aware typing: map characters through the active layout instead of assuming US;

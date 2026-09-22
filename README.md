@@ -179,6 +179,23 @@ Coordinates on the CLI are scanout pixels. `cuad --check` grabs one frame and cr
 the input devices without serving; `cuad --no-record`, `--record-codec`, `--record-dir`
 control recording.
 
+## Virtual desktop
+
+An agent can get its own desktop next to yours, captured and driven by the same tool:
+`vkms` (the kernel's virtual KMS driver) provides a second DRM card, weston runs on it
+with the pixman renderer on its own seat, and a second `cuad` serves it.
+
+```sh
+packaging/virtual/install.sh            # vkms.ko, udev seat rule, weston + cuad units
+export WAYLAND_DISPLAY=/run/kmscua-virtual/wayland/wayland-0   # apps go here
+export KMSCUA_SOCKET=/run/kmscua-virtual/cuad/cuad.sock        # cua and the MCP too
+claude mcp add kmscua-virtual -e KMSCUA_SOCKET=$KMSCUA_SOCKET -e WAYLAND_DISPLAY=$WAYLAND_DISPLAY -- /usr/local/bin/cua mcp
+```
+
+Input devices are routed by udev seat, so the real session never sees the agent's
+keyboard. Design, the two Jetson quirks (5.18 vkms sources on a 5.15 tree, a libseat
+`O_NONBLOCK` shim) and limits: [docs/virtual-desktop.md](docs/virtual-desktop.md).
+
 ## Limitations
 
 - **Pixels first, almost no window metadata.** kmscua does not know where windows are.
@@ -192,8 +209,8 @@ control recording.
 - **X11 is not the target.** It works there too (the scanout is below X), but X11 already
   has `xdotool`, `xwd`, `wmctrl` and XTEST with window awareness; kmscua brings nothing
   they lack. Use it on X11 only if you want one tool across both.
-- **Needs a real KMS scanout.** Root or `CAP_SYS_ADMIN`, an active CRTC on a DRM card.
-  No headless without a connected display or a dummy plug, no VM guests whose scanout is
+- **Needs a KMS scanout.** Root or `CAP_SYS_ADMIN`, an active CRTC on a DRM card.
+  Headless works through `vkms` (see Virtual desktop); no VM guests whose scanout is
   host-rendered (virgl), no nested compositors, no remote sessions. A blanked output
   captures black; `cua wake` nudges it.
 - **One CRTC per screenshot.** Multi-monitor is not stitched yet; the input range already

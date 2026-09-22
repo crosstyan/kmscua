@@ -24,6 +24,15 @@ use crate::keymap;
 pub const POINTER_NAME: &str = "kmscua absolute pointer";
 pub const KEYBOARD_NAME: &str = "kmscua keyboard";
 
+/// Device names carry the seat so a udev rule can route them:
+/// `kmscua@<seat> absolute pointer`, `kmscua@<seat> keyboard`.
+pub fn device_names(seat: Option<&str>) -> (String, String) {
+    match seat {
+        Some(s) => (format!("kmscua@{s} absolute pointer"), format!("kmscua@{s} keyboard")),
+        None => (POINTER_NAME.to_string(), KEYBOARD_NAME.to_string()),
+    }
+}
+
 const SYN: u16 = 0;
 const KEY_MAX_CODE: u16 = 0x2ff;
 /// KEY_MICMUTE, the last plain keyboard code before the BTN_* ranges.
@@ -32,13 +41,20 @@ const KEYBOARD_MAX_CODE: u16 = 248;
 pub struct Input {
     pointer: VirtualDevice,
     keyboard: VirtualDevice,
+    names: (String, String),
     desktop: Rect,
     /// Pause between press and release, and between clicks.
     tap_ms: u64,
 }
 
 impl Input {
-    pub fn create(desktop: Rect) -> Result<Self> {
+    /// The uinput device names, as udev and the compositor see them.
+    pub fn names(&self) -> (String, String) {
+        self.names.clone()
+    }
+
+    pub fn create(desktop: Rect, seat: Option<&str>) -> Result<Self> {
+        let (pointer_name, keyboard_name) = device_names(seat);
         let w = desktop.width.max(1) as i32;
         let h = desktop.height.max(1) as i32;
         let abs_x = UinputAbsSetup::new(
@@ -61,7 +77,7 @@ impl Input {
         let props = AttributeSet::from_iter([PropType::DIRECT]);
         let pointer = VirtualDevice::builder()
             .context("uinput builder (is /dev/uinput present and writable?)")?
-            .name(POINTER_NAME)
+            .name(&pointer_name)
             .with_properties(&props)?
             .with_absolute_axis(&abs_x)?
             .with_absolute_axis(&abs_y)?
@@ -80,7 +96,7 @@ impl Input {
         }
         let keyboard = VirtualDevice::builder()
             .context("uinput builder")?
-            .name(KEYBOARD_NAME)
+            .name(&keyboard_name)
             .with_keys(&keys)?
             .build()
             .context("create uinput keyboard")?;
@@ -92,6 +108,7 @@ impl Input {
         Ok(Self {
             pointer,
             keyboard,
+            names: (pointer_name.clone(), keyboard_name.clone()),
             desktop,
             tap_ms: 30,
         })

@@ -1,0 +1,25 @@
+[Unit]
+Description=kmscua daemon for the virtual desktop (vkms card, seat-kmscua)
+Documentation=https://github.com/crosstyan/kmscua
+After=systemd-udevd.service
+# Starts after the compositor when both are enabled; if the CRTC is not active
+# yet, cuad exits and Restart= tries again.
+After=kmscua-virtual-weston@.service
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe uinput
+ExecStart=/usr/local/bin/cuad --device /dev/dri/by-path/platform-vkms-card --seat seat-kmscua --socket /run/kmscua-virtual/cuad/cuad.sock --group kmscua --record-dir /var/lib/kmscua-virtual/recordings
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=kmscua-virtual/cuad
+RuntimeDirectoryMode=0755
+StateDirectory=kmscua-virtual
+Environment=RUST_LOG=info
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

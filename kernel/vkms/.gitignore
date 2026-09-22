@@ -1,0 +1,8 @@
+drivers/
+*.o
+*.ko
+*.mod*
+*.cmd
+.*.cmd
+Module.symvers
+modules.order

@@ -20,7 +20,7 @@ use kmscua_proto::{
 use serde_json::json;
 
 use crate::capture::Capturer;
-use crate::input::{Input, KEYBOARD_NAME, POINTER_NAME};
+use crate::input::Input;
 use crate::recorder::{self, Codec, RecordOpts, Recorder};
 
 /// None = detection still running; Some(None) = recording unavailable.
@@ -523,8 +523,8 @@ impl Daemon {
             gpu_driver,
             displays: serde_json::from_value(displays)?,
             desktop: self.input.desktop(),
-            pointer_device: POINTER_NAME.to_string(),
-            keyboard_device: KEYBOARD_NAME.to_string(),
+            pointer_device: self.input.names().0,
+            keyboard_device: self.input.names().1,
             cursor_supported,
             requests_served: self.served,
             record_dir: record_codec.as_ref().map(|_| self.record_dir.clone()),

@@ -1,0 +1,11 @@
+# kmscua virtual desktop (vkms + weston on its own seat).
+#
+# The uinput devices cuad creates with `--seat seat-kmscua` are named
+# "kmscua@seat-kmscua …". Give them ID_SEAT so the compositor on that seat
+# (weston --seat=seat-kmscua) takes them and the real session's libinput on
+# seat0 ignores them, and let the kmscua group open them so weston can run
+# unprivileged. The vkms card itself needs nothing: mutter already ignores it
+# (61-mutter.rules) and it stays on seat0 without a master, so logind and gdm
+# do not treat it as a new seat.
+SUBSYSTEM=="input", ATTRS{name}=="kmscua@seat-kmscua *", ENV{ID_SEAT}="seat-kmscua", TAG-="seat"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="kmscua@seat-kmscua *", GROUP="kmscua", MODE="0660"

@@ -40,6 +40,11 @@ struct Args {
     /// libdrmtap privilege helper, for running without CAP_SYS_ADMIN.
     #[arg(long)]
     helper: Option<String>,
+    /// Name the uinput devices `kmscua@<seat> …` so a udev rule can give them
+    /// to a compositor on another seat (the virtual desktop). Default: the
+    /// plain names, which land on seat0 like a physical keyboard.
+    #[arg(long, env = "KMSCUA_SEAT")]
+    seat: Option<String>,
     /// Disable screen recording (on by default when a GStreamer H.264
     /// encoder is present).
     #[arg(long)]
@@ -71,7 +76,7 @@ fn main() -> Result<()> {
         capture.gpu_driver(),
         if capture.cursor_supported() { "ok" } else { "unavailable" }
     );
-    let input = input::Input::create(desktop).context("create uinput devices")?;
+    let input = input::Input::create(desktop, args.seat.as_deref()).context("create uinput devices")?;
     // Encoder detection shells out to gst-inspect, which rebuilds the
     // GStreamer registry on first run as root (25 s measured). Do it off
     // the startup path; recording requests before it finishes are refused
