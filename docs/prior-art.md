@@ -128,6 +128,14 @@ Nobody hands a model a video. The patterns that work:
 kmscua's `record_stop` manifest + timeline + contact sheet, `record_frames … between`,
 `wait_for_stable` and `wait_for_change` follow directly from these.
 
+One observed session (2026-09-22, a Flutter app's replay flicker) showed what was
+missing: the agent called `record_frames` once, then wrote its own ffmpeg pipelines to
+crop the video to the panel it cared about, decode every frame, diff consecutive frames
+with PIL and tile the results into dense sheets. Those three needs, a region, a
+frame-by-frame change list, and tiling, became `region`, `scene` (per-frame pixel diff,
+not ffmpeg's scene score) and `sheet`, plus `cua record changes` for agents that prefer
+the shell.
+
 ## Image pipeline (measured)
 
 The first version resized with `image::imageops::resize`, which was the whole screenshot

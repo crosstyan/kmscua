@@ -40,8 +40,8 @@ window listing, the cached tree walk and the focused-node search.
   lists them; `plan_size` and the ABS range already assume the union.
 - Blanked output: detect an all-black frame and nudge (`Wake`) before retrying, instead
   of returning black.
-- Region-diff keyframe picker for `record_frames`: ffmpeg's scene score is coarse on
-  UI; a per-region pixel diff at the recorded fps would catch a tab switch reliably.
+- `record_frames` extracts each still with its own ffmpeg seek (about 0.3 s each);
+  one pass with a `select` filter would make a 30-frame sheet several times faster.
 - Cursor hotspot: libdrmtap reports `hot_x/hot_y` 0 on Tegra, so `cursor_position` is
   off by the cursor's hotspot (6-14 px scanout). Either read the hotspot from the DRM
   plane properties where the driver exposes them, or report the last injected position.

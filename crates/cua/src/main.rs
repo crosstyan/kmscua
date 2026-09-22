@@ -10,7 +10,7 @@ mod mcp;
 mod session;
 mod video;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::io::Write;
 
@@ -99,6 +99,11 @@ enum Cmd {
         /// accepts up to 2576, 1080p is the documented cost/accuracy balance).
         #[arg(long)]
         max_side: Option<u32>,
+        /// `all` (default) or `core`: only the vendor-shaped tools the model
+        /// was trained on, no wait_for_*, record_* or get_focused. Use `core`
+        /// in a harness that loads every tool schema into the context.
+        #[arg(long, default_value = "all")]
+        tools: String,
     },
 }
 
@@ -130,20 +135,63 @@ enum RecordCmd {
         #[arg(long, default_value_t = 6)]
         tiles: u32,
     },
-    /// Extract frames: --at 1.5,3 | --every 2 | --scene 0.3
+    /// Extract frames: --at 1.5,3 | --every 2 | --scene 0.005 [--region x,y,w,h] [--sheet]
     Frames {
         path: PathBuf,
         #[arg(long, value_delimiter = ',')]
         at: Option<Vec<f32>>,
         #[arg(long)]
         every: Option<f32>,
+        /// Fraction (0..1) of region pixels that must change between
+        /// consecutive frames; every frame is compared.
         #[arg(long)]
         scene: Option<f32>,
+        /// Only this screen rectangle, x,y,w,h in scanout pixels (video
+        /// pixels if the recording has no manifest).
+        #[arg(long)]
+        region: Option<String>,
         #[arg(long, default_value_t = 8)]
         max: usize,
+        #[arg(long, default_value_t = 800)]
+        max_side: u32,
+        /// One tiled PNG instead of one file per frame.
+        #[arg(long)]
+        sheet: bool,
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
     },
+    /// List the runs of frames where a region changed, frame by frame.
+    Changes {
+        path: PathBuf,
+        /// x,y,w,h in scanout pixels (video pixels without a manifest).
+        #[arg(long)]
+        region: Option<String>,
+        /// Fraction (0..1) of region pixels that must differ from the previous frame.
+        #[arg(long, default_value_t = 0.005)]
+        threshold: f32,
+        #[arg(long, default_value_t = 0.0)]
+        from: f32,
+        #[arg(long)]
+        to: Option<f32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the manifest written beside a recording.
+    Info { path: PathBuf },
+}
+
+fn cli_crop(path: &Path, region: &Option<String>) -> Result<Option<video::Crop>> {
+    let Some(r) = region else { return Ok(None) };
+    let v: Vec<i32> = r.split(',').map(|x| x.trim().parse::<i32>()).collect::<std::result::Result<_, _>>().context("region is x,y,w,h")?;
+    let [x, y, w, h] = v[..] else { bail!("region is x,y,w,h") };
+    let crop = match video::read_manifest(path) {
+        Ok(m) if m.scale > 0.0 => video::crop_from_scanout(&m, x, y, w, h),
+        _ => {
+            let (vw, vh, _) = video::probe(path)?;
+            video::Crop { x: x.max(0) as u32, y: y.max(0) as u32, w: w.max(2) as u32, h: h.max(2) as u32 }.clamp_to(vw, vh)
+        }
+    };
+    crop.map(Some).ok_or_else(|| anyhow::anyhow!("region lies outside the video"))
 }
 
 fn parse_button(s: &str) -> Result<Button, String> {
@@ -278,9 +326,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Record(rc) => record_cmd(&c, rc),
-        Cmd::Mcp { max_side } => {
+        Cmd::Mcp { max_side, tools } => {
+            let core = match tools.as_str() {
+                "all" => false,
+                "core" => true,
+                other => bail!("--tools must be all or core, not {other}"),
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(mcp::serve(c, *max_side))
+            rt.block_on(mcp::serve(c, *max_side, core))
         }
     }
 }
@@ -319,8 +372,17 @@ fn record_cmd(c: &Client, rc: &RecordCmd) -> Result<()> {
                 info.finalized.unwrap_or(false),
                 info.error.clone().unwrap_or_default()
             );
+            let started = std::time::SystemTime::now() - std::time::Duration::from_secs_f32(info.seconds.max(0.0));
+            let source = c
+                .call(&Request::Status)
+                .ok()
+                .and_then(|r| r.data::<kmscua_proto::Status>().ok())
+                .map(|s| (s.desktop.width, s.desktop.height))
+                .unwrap_or((0, 0));
+            let _ = video::write_manifest(&path, &video::manifest_from(&info, started, source, &[]));
             if let Some(dest) = out {
                 std::fs::copy(&path, dest).with_context(|| format!("copy to {}", dest.display()))?;
+                let _ = std::fs::copy(video::manifest_path(&path), video::manifest_path(dest));
                 println!("{}", dest.display());
             } else {
                 println!("{}", path.display());
@@ -336,12 +398,20 @@ fn record_cmd(c: &Client, rc: &RecordCmd) -> Result<()> {
             println!("{}", out.display());
             Ok(())
         }
-        RecordCmd::Frames { path, at, every, scene, max, out_dir } => {
+        RecordCmd::Frames { path, at, every, scene, region, max, max_side, sheet, out_dir } => {
             let dur = video::duration(path)?;
+            let crop = cli_crop(path, region)?;
             let times: Vec<f32> = if let Some(at) = at {
                 at.clone()
             } else if let Some(th) = scene {
-                video::scene_changes(path, *th, 0.0, dur)?
+                let (_, _, fps) = video::probe(path)?;
+                let (runs, n) = video::changes(path, 0.0, dur, crop, th.clamp(0.0, 1.0))?;
+                eprintln!("{}", video::describe_runs(&runs, n, fps, 0.0, dur, *th, if crop.is_some() { "region" } else { "whole frame" }));
+                if runs.is_empty() {
+                    vec![0.0, dur]
+                } else {
+                    video::run_times(&runs, fps, 0.0)
+                }
             } else {
                 let step = every.unwrap_or((dur / (*max as f32 - 1.0).max(1.0)).max(0.1));
                 let mut v = Vec::new();
@@ -354,13 +424,41 @@ fn record_cmd(c: &Client, rc: &RecordCmd) -> Result<()> {
             };
             let times = video::thin(times, *max);
             std::fs::create_dir_all(out_dir)?;
-            for (t, png) in video::frames_at(path, &times, 800)? {
+            if *sheet {
+                let cols = (times.len() as f32).sqrt().ceil().clamp(1.0, 6.0) as u32;
+                let frames = video::frames_at(path, &times, (*max_side).min((1920 / cols).max(160)), crop)?;
+                let png = video::tile(&frames.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), cols)?;
+                let f = out_dir.join("sheet.png");
+                std::fs::write(&f, png)?;
+                eprintln!("{} tiles, {cols} across, at seconds: {}", frames.len(), frames.iter().map(|(t, _)| format!("{t:.2}")).collect::<Vec<_>>().join(", "));
+                println!("{}", f.display());
+                return Ok(());
+            }
+            for (t, png) in video::frames_at(path, &times, *max_side, crop)? {
                 let f = out_dir.join(format!("frame-{t:07.2}.png"));
                 std::fs::write(&f, png)?;
                 println!("{}", f.display());
             }
             Ok(())
         }
+        RecordCmd::Changes { path, region, threshold, from, to, json } => {
+            let dur = video::duration(path)?;
+            let (_, _, fps) = video::probe(path)?;
+            let crop = cli_crop(path, region)?;
+            let to = to.unwrap_or(dur);
+            let (runs, n) = video::changes(path, *from, to, crop, threshold.clamp(0.0, 1.0))?;
+            if *json {
+                let v: Vec<serde_json::Value> = runs
+                    .iter()
+                    .map(|r| serde_json::json!({"start": r.start, "end": r.end, "frames": r.frames, "peak": r.peak}))
+                    .collect();
+                print_json(&serde_json::json!({"frames": n, "fps": fps, "from": from, "to": to, "threshold": threshold, "runs": v}))
+            } else {
+                println!("{}", video::describe_runs(&runs, n, fps, *from, to, *threshold, if crop.is_some() { "region" } else { "whole frame" }));
+                Ok(())
+            }
+        }
+        RecordCmd::Info { path } => print_json(&serde_json::to_value(video::read_manifest(path)?)?),
     }
 }
 

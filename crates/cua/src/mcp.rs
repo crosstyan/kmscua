@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use kmscua_proto::{
@@ -46,13 +46,28 @@ struct View {
     scale: f32,
     ox: i32,
     oy: i32,
+    /// Scanout size the screenshot was taken from (0 before the first shot).
+    src_w: u32,
+    src_h: u32,
 }
 
 struct RecState {
     started: Instant,
-    path: PathBuf,
+    started_wall: SystemTime,
     timeline: Vec<(f32, String)>,
 }
+
+/// Tools outside the vendor-shaped vocabulary; dropped by `--tools core`.
+const EXTRA_TOOLS: &[&str] = &[
+    "wait_for_stable",
+    "wait_for_change",
+    "record_start",
+    "record_mark",
+    "record_status",
+    "record_stop",
+    "record_frames",
+    "get_focused",
+];
 
 #[derive(Clone)]
 pub struct CuaServer {
@@ -242,15 +257,24 @@ pub struct RecordFramesParams {
     pub at: Option<Vec<f32>>,
     /// Extract one frame every N seconds.
     pub every: Option<f32>,
-    /// Extract frames where the picture changed at least this much (0..1).
-    /// UI changes are small: 0.05-0.1 catches a tab switch. Overrides `every`.
+    /// Extract frames where the region changed: the fraction (0..1) of
+    /// pixels that must differ from the previous frame. Every frame is
+    /// compared, so this catches a one-frame flicker. 0.005 for small
+    /// widgets, 0.02 for a panel; 0 lists every frame. Overrides `every`.
     pub scene: Option<f32>,
     /// Between these two timeline entries (indices from record_stop).
     pub between: Option<[u32; 2]>,
-    /// Max frames returned, default 8.
+    /// Only this part of the screen, [x, y, width, height] in the last
+    /// screenshot's pixels: frames are cropped to it and `scene` looks only
+    /// at it.
+    pub region: Option<[i32; 4]>,
+    /// Max frames returned, default 8 (up to 24 as separate images, 60 on a sheet).
     pub max: Option<u32>,
     /// Longest side of each frame, default 800.
     pub max_side: Option<u32>,
+    /// Return all frames tiled into one image, reading order, instead of one
+    /// image per frame. Cheaper and easier to compare; default false.
+    pub sheet: Option<bool>,
 }
 
 // ---------- helpers ----------
@@ -332,6 +356,8 @@ impl CuaServer {
             scale: info.scale,
             ox: info.origin_x,
             oy: info.origin_y,
+            src_w: info.source_width,
+            src_h: info.source_height,
         };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&reply.payload);
         Ok(Content::image(b64, info.mime))
@@ -629,15 +655,21 @@ impl CuaServer {
 
 #[tool_router]
 impl CuaServer {
-    pub fn new(client: Client, max_side: u32) -> Self {
+    pub fn new(client: Client, max_side: u32, core_only: bool) -> Self {
+        let mut tool_router = Self::tool_router();
+        if core_only {
+            for t in EXTRA_TOOLS {
+                tool_router.remove_route(t);
+            }
+        }
         Self {
             client: Arc::new(client),
-            view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0 })),
+            view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0, src_w: 0, src_h: 0 })),
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
             ui: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -886,7 +918,7 @@ impl CuaServer {
         let path = PathBuf::from(info.path.clone().unwrap_or_default());
         *self.rec.lock().unwrap() = Some(RecState {
             started: Instant::now(),
-            path: path.clone(),
+            started_wall: SystemTime::now(),
             timeline: vec![(0.0, "record_start".into())],
         });
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -937,12 +969,31 @@ impl CuaServer {
             info.finalized.unwrap_or(false),
             info.error.clone().unwrap_or_default()
         )];
-        if let Some(s) = &state {
+        let (started_wall, timeline) = match &state {
+            Some(s) => (s.started_wall, s.timeline.clone()),
+            None => (SystemTime::now() - Duration::from_secs_f32(info.seconds.max(0.0)), Vec::new()),
+        };
+        let source = {
+            let v = *self.view.lock().unwrap();
+            if v.src_w > 0 {
+                (v.src_w, v.src_h)
+            } else {
+                self.blocking(|c| c.call(&Request::Status))
+                    .await
+                    .ok()
+                    .and_then(|r| r.data::<kmscua_proto::Status>().ok())
+                    .map(|s| (s.desktop.width, s.desktop.height))
+                    .unwrap_or((0, 0))
+            }
+        };
+        let manifest = video::manifest_from(&info, started_wall, source, &timeline);
+        let _ = video::write_manifest(&path, &manifest);
+        lines[0].push_str(&format!(" | started {} | manifest {}", manifest.started_at, video::manifest_path(&path).display()));
+        if !timeline.is_empty() {
             lines.push("timeline:".into());
-            for (i, (t, what)) in s.timeline.iter().enumerate() {
+            for (i, (t, what)) in timeline.iter().enumerate() {
                 lines.push(format!("  [{i}] {t:7.2}s  {what}"));
             }
-            let _ = video::write_timeline(&path, &s.timeline);
         }
         let mut content = vec![Content::text(lines.join("\n"))];
         if p.sheet.unwrap_or(true) && info.finalized.unwrap_or(false) {
@@ -965,11 +1016,12 @@ impl CuaServer {
 
     #[tool(
         name = "record_frames",
-        description = "Extract still frames from a recording: at exact seconds (`at`), every N seconds (`every`), where the picture changed (`scene`, 0..1), or between two timeline entries (`between`). Returns up to `max` images with their timestamps."
+        description = "Extract still frames from a recording: at exact seconds (`at`), every N seconds (`every`), where a region changed frame by frame (`scene` + `region`), or between two timeline entries (`between`). Returns the frames with timestamps, one image each or tiled on one sheet (`sheet`). With `scene` it also lists every run of changed frames, so a flicker shows up even when it is not among the returned frames."
     )]
     async fn record_frames(&self, Parameters(p): Parameters<RecordFramesParams>) -> Result<CallToolResult, ErrorData> {
         let path = self.rec_path_or_last(p.path.clone())?;
-        let max = p.max.unwrap_or(8).clamp(1, 24) as usize;
+        let sheet = p.sheet.unwrap_or(false);
+        let max = p.max.unwrap_or(8).clamp(1, if sheet { 60 } else { 24 }) as usize;
         let side = p.max_side.unwrap_or(800).clamp(64, 2000);
         let (t0, t1) = match p.between {
             Some([a, b]) => {
@@ -979,19 +1031,42 @@ impl CuaServer {
             }
             None => (None, None),
         };
+        let view = *self.view.lock().unwrap();
         let p2 = path.clone();
-        let frames = self
+        let (frames, note) = self
             .blocking(move |_| {
                 let dur = video::duration(&p2)?;
+                let (vw, vh, fps) = video::probe(&p2)?;
+                // Region: screenshot px -> scanout px (view) -> video px (manifest scale).
+                let crop = p.region.and_then(|[x, y, w, h]| {
+                    let sx = |v: i32| (v as f32 * view.scale).round() as i32;
+                    let (x, y, w, h) = (sx(x) + view.ox, sx(y) + view.oy, sx(w), sx(h));
+                    match video::read_manifest(&p2) {
+                        Ok(m) if m.scale > 0.0 => video::crop_from_scanout(&m, x, y, w, h),
+                        _ => {
+                            let f = if view.src_w > 0 { vw as f32 / view.src_w as f32 } else { 1.0 };
+                            let g = |v: i32| (v as f32 * f).round().max(0.0) as u32;
+                            video::Crop { x: g(x), y: g(y), w: g(w).max(2), h: g(h).max(2) }.clamp_to(vw, vh)
+                        }
+                    }
+                });
                 let (a, b) = (t0.unwrap_or(0.0), t1.unwrap_or(dur));
+                let mut note = String::new();
                 let times: Vec<f32> = if let Some(at) = p.at.clone() {
                     at
                 } else if let Some(th) = p.scene {
-                    let mut v = video::scene_changes(&p2, th, a, b)?;
-                    if v.is_empty() {
-                        v = vec![a, b];
+                    let th = th.clamp(0.0, 1.0);
+                    let (runs, n) = video::changes(&p2, a, b, crop, th)?;
+                    let where_ = match crop {
+                        Some(c) => format!("region {}x{} at {},{} of the {vw}x{vh} video", c.w, c.h, c.x, c.y),
+                        None => format!("whole {vw}x{vh} frame"),
+                    };
+                    note = video::describe_runs(&runs, n, fps, a, b, th, &where_) + "\n";
+                    if runs.is_empty() {
+                        vec![a, b]
+                    } else {
+                        video::run_times(&runs, fps, a)
                     }
-                    v
                 } else {
                     let step = p.every.unwrap_or(((b - a) / (max as f32 - 1.0).max(1.0)).max(0.1));
                     let mut v = Vec::new();
@@ -1002,15 +1077,31 @@ impl CuaServer {
                     }
                     v
                 };
-                video::frames_at(&p2, &video::thin(times, max), side)
+                let times = video::thin(times, max);
+                let cols = if sheet { (times.len() as f32).sqrt().ceil().clamp(1.0, 6.0) as u32 } else { 1 };
+                let side = if sheet { side.min((1920 / cols).max(160)) } else { side };
+                let frames = video::frames_at(&p2, &times, side, crop)?;
+                if sheet && frames.len() > 1 {
+                    let png = video::tile(&frames.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), cols)?;
+                    note.push_str(&format!("{} tiles, {cols} across, reading order, at seconds: ", frames.len()));
+                    note.push_str(&frames.iter().map(|(t, _)| format!("{t:.2}")).collect::<Vec<_>>().join(", "));
+                    return Ok((vec![(f32::NAN, png)], note));
+                }
+                Ok((frames, note))
             })
             .await?;
-        let mut content = vec![Content::text(format!(
-            "{} frames from {} at seconds: {}",
+        let mut content = Vec::new();
+        if frames.len() == 1 && frames[0].0.is_nan() {
+            content.push(Content::text(format!("{note}\nfrom {}", path.display())));
+            content.push(Content::image(base64::engine::general_purpose::STANDARD.encode(&frames[0].1), "image/png"));
+            return Ok(CallToolResult::success(content));
+        }
+        content.push(Content::text(format!(
+            "{note}{} frames from {} at seconds: {}",
             frames.len(),
             path.display(),
             frames.iter().map(|(t, _)| format!("{t:.2}")).collect::<Vec<_>>().join(", ")
-        ))];
+        )));
         for (t, png) in frames {
             content.push(Content::text(format!("t={t:.2}s")));
             content.push(Content::image(base64::engine::general_purpose::STANDARD.encode(&png), "image/png"));
@@ -1044,7 +1135,7 @@ impl CuaServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for CuaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1055,8 +1146,8 @@ impl ServerHandler for CuaServer {
     }
 }
 
-pub async fn serve(client: Client, max_side: Option<u32>) -> anyhow::Result<()> {
-    let server = CuaServer::new(client, max_side.unwrap_or(DEFAULT_MAX_SIDE));
+pub async fn serve(client: Client, max_side: Option<u32>, core_only: bool) -> anyhow::Result<()> {
+    let server = CuaServer::new(client, max_side.unwrap_or(DEFAULT_MAX_SIDE), core_only);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

@@ -132,13 +132,17 @@ intact. Every mutating action also accepts `settle: true` to append the settled 
 | `wait_for_change {region, timeout_ms, threshold}` | "changed after 0.4s" or "timed out, no change" + screenshot |
 | `record_start {name, fps, max_side, max_seconds}` | path, size, codec; every later tool call is stamped into a timeline |
 | `record_mark {note}` | stamps free text into the timeline |
-| `record_stop {sheet, tiles}` | manifest + numbered timeline + contact sheet |
-| `record_frames {path, at[], every, scene, between[i,j], max, max_side}` | stills with timestamps |
+| `record_stop {sheet, tiles}` | manifest + numbered timeline + contact sheet; writes `<name>.json` beside the MP4 |
+| `record_frames {path, at[], every, scene, region, between[i,j], max, max_side, sheet}` | stills with timestamps, or one tiled sheet; with `scene` every frame of `region` is compared and the runs of changed frames are listed |
 | `record_status`, `doctor` | text |
 | `get_focused` | active app, window title, focused element with its exact text and caret (AT-SPI, read-only) |
 
 The model never receives a video. It gets a manifest, stills, and a timeline, which is
 what Playwright traces, browser-use, Cua and the GUI-agent papers converge on. The
+manifest (`<recording>.json`) carries the wall-clock start with milliseconds, the
+scanout size and scale, fps, codec, frame and drop counts, and the timeline with
+wall-clock stamps, so a recording lines up with application logs and screen coordinates
+map to video pixels later. `cua record info` prints it. The
 timeline is also written beside the MP4 as `<name>.timeline.jsonl`.
 
 Screenshots default to 1920 px on the long side (`cua mcp --max-side N`), Anthropic's
@@ -155,9 +159,21 @@ cua cursor | displays | status | wake | doctor
 cua record start [--name n] [--fps 15] [--max-side 1920] [--max-seconds 600]
 cua record stop [-o out.mp4] | status
 cua record sheet rec.mp4 -o sheet.png --tiles 6
-cua record frames rec.mp4 --scene 0.05 --max 6 --out-dir frames/
-cua mcp [--max-side 1920]
+cua record frames rec.mp4 --scene 0.005 --region 880,300,2120,1800 --sheet --out-dir frames/
+cua record changes rec.mp4 --region 880,300,2120,1800 --threshold 0.005 [--json]
+cua record info rec.mp4
+cua mcp [--max-side 1920] [--tools all|core]
 ```
+
+`record changes` compares every frame of the region with the one before it and prints the
+runs of changed frames, so a one-frame flicker is found without extracting anything.
+This is the same detector `record_frames … scene` uses in the MCP.
+
+**Context cost.** Claude Code loads MCP tool schemas lazily, so the whole server costs
+about one line per tool name until a tool is used. A harness that loads every schema up
+front pays about 18k characters for `--tools all`; `--tools core` keeps the 19
+vendor-shaped tools (11k) and leaves recording, `wait_for_*` and `get_focused` to the
+CLI, which the agent reads with `--help` only when it needs them.
 
 Coordinates on the CLI are scanout pixels. `cuad --check` grabs one frame and creates
 the input devices without serving; `cuad --no-record`, `--record-codec`, `--record-dir`
