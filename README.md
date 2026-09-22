@@ -2,88 +2,124 @@
 
 Computer use for Linux that works below the compositor.
 
-`cuad` runs as root, reads the GPU scanout through [libdrmtap](https://github.com/fxd0h/libdrmtap)
-(DRM/KMS, zero-copy, EGL detile on NVIDIA) and injects input through two uinput devices
-it creates once at start. `cua` is the unprivileged client: a CLI and an MCP stdio server
-that speaks Anthropic's computer-use vocabulary (`screenshot`, `left_click`, `key`, `type`, ...).
+`cuad` runs as root, reads the GPU scanout through
+[libdrmtap](https://github.com/fxd0h/libdrmtap) (DRM/KMS, zero-copy, EGL detile on NVIDIA)
+and injects input through two uinput devices it creates once at start. `cua` is the
+unprivileged client: a CLI, and an MCP server whose tools copy the computer-use vocabulary
+Claude models are trained on.
 
-Because nothing talks to a compositor, it works the same on GNOME Wayland, KDE, Xfce,
-X11, the lock screen and the GDM greeter, with no consent dialog, and it coexists with a
-running RustDesk session (both are read-only DRM clients; input devices are independent).
+Because nothing talks to a compositor, it behaves the same on GNOME Wayland, KDE, Xfce,
+X11, the lock screen and the GDM greeter. No consent dialog, no portal, no private
+compositor API that a future release can close. It coexists with a running RustDesk
+session: both are read-only DRM clients, and the input devices are independent.
 
-Measured on a Jetson Orin (GNOME 42 Wayland, 3840x2160, nvidia-drm): grab 20-36 ms,
-resize+PNG to 1280 px 130-160 ms, cursor composited from the hardware cursor plane.
+Measured on a Jetson Orin (GNOME 42 Wayland, 3840x2160, nvidia-drm):
 
-## Layout
+| Operation | Time |
+|---|---|
+| scanout grab with cursor | 20-36 ms |
+| resize + PNG to 1920 px | 130-160 ms |
+| screen recording | 1080p at 15 fps, hardware H.264, zero dropped frames |
 
-```
-crates/proto   wire protocol + blocking client (length-prefixed JSON, binary payload)
-crates/cuad    root daemon: capture.rs (libdrmtap + cursor composite), input.rs (uinput),
-               keymap.rs (US layout, key names), server.rs (unix socket, one request at a time)
-crates/cua     CLI + MCP server; session.rs finds the user's Wayland/X env for clipboard paste
-third_party/libdrmtap   vendored MIT library, with the Tegra cursor EGL fallback patch applied
-packaging/     systemd unit + install script
-```
+Why this route and not the others: [docs/prior-art.md](docs/prior-art.md).
 
 ## Install
 
 ```
-packaging/install.sh            # builds, installs, creates group kmscua, enables cuad.service
-sg kmscua -c 'cua doctor'       # or log in again so the group applies
+packaging/install.sh                # builds, installs, creates group kmscua, enables cuad.service
+cua doctor                          # everything should say true
 cua screenshot -o shot.png --max-side 1280
 cua click 1920 24 && cua key escape
+claude mcp add kmscua -- /usr/local/bin/cua mcp
 ```
 
-Register the MCP server: `claude mcp add kmscua -- /usr/local/bin/cua mcp`.
+For oh-my-pi, add to `~/.omp/agent/mcp.json`:
 
-## Recording
-
-On by default when a GStreamer H.264 encoder exists. `cuad` picks `nvv4l2h264enc` (Jetson),
-`nvh264enc` (desktop NVENC), then `x264enc`/`openh264enc`. The encoder runs as a
-`gst-launch-1.0` child fed raw RGBA over a pipe, so nothing from GStreamer or the NVIDIA
-stack is linked into the root daemon. Frames are box-downscaled in-process (4K -> 1080p is a
-2x2 average), one frame per tick, previous frame repeated if a grab is late, so video time
-equals wall time. Files land in `/var/lib/kmscua/recordings`, owned by the socket owner.
-
-```
-cua record start --name demo --fps 15
-cua record stop -o ~/demo.mp4
-cua record sheet ~/demo.mp4 -o sheet.png --tiles 6
-cua record frames ~/demo.mp4 --scene 0.05 --max 6 --out-dir frames/
+```json
+{ "mcpServers": { "kmscua": { "type": "stdio", "command": "/usr/local/bin/cua", "args": ["mcp"] } } }
 ```
 
-Flags: `--no-record`, `--record-codec x264enc`, `--record-dir`. Encoder detection runs in a
-background thread at start (the first `gst-inspect` as root rebuilds the registry, 25 s).
+Requirements: a DRM card with an active CRTC, kernel `uinput` (L4T ships without it; a
+DKMS-style build is in the TODO), root for `cuad`, `wl-clipboard` or `xclip` in the
+session for non-ASCII typing, `ffmpeg` for contact sheets and frame extraction, and for
+recording a GStreamer H.264 encoder (`nvv4l2h264enc` on Jetson, `nvh264enc`, `x264enc` or
+`openh264enc` elsewhere).
+
+## Layout
+
+```
+crates/proto   wire protocol + blocking client: u32 length-prefixed JSON, binary payload after
+crates/cuad    root daemon
+               capture.rs   libdrmtap grab, cursor composite, crop, resize, encode
+               input.rs     uinput absolute pointer + keyboard; every request atomic
+               keymap.rs    US layout and xdotool key names
+               recorder.rs  fixed-rate frame loop into a gst-launch child, MP4 out
+               server.rs    unix socket loop + capture worker thread
+crates/cua     client
+               main.rs      CLI
+               mcp.rs       MCP server (rmcp), coordinate mapping, wait/record extras
+               video.rs     ffmpeg contact sheets, frames, scene changes, timeline sidecar
+               session.rs   finds the user's Wayland/X/D-Bus env from /proc
+third_party/libdrmtap   vendored MIT library with the Tegra cursor EGL fallback patch
+packaging/     systemd unit + install script
+docs/          prior art, vendor tool shapes
+```
+
+## How it works
+
+**Capture.** `drmtap_grab_mapped` returns the current scanout as tightly packed BGRX (EGL
+detiles block-linear buffers on NVIDIA). The hardware cursor lives on its own KMS plane,
+so it is read separately and composited with premultiplied alpha. Frames are cropped and
+resized in-process and encoded to PNG or JPEG.
+
+**Input.** The pointer is a uinput device with `ABS_X`/`ABS_Y` whose range equals the
+union of the active displays, so `ABS(x, y)` lands on scanout pixel `(x, y)`, the same
+pixel the screenshot shows. The keyboard advertises `KEY_ESC..=KEY_MICMUTE` only:
+advertising `BTN_*` codes gets the device tagged as a joystick and libinput drops it.
+Every request releases whatever it pressed before it answers, including on error, so
+another pointer (a human, RustDesk) can interleave between requests but never inside one.
+
+**Recording.** A capture worker thread owns the DRM context. While recording it grabs a
+frame every tick, box-downscales by an integer factor (4K to 1080p is a 2x2 average) and
+writes raw RGBA to `gst-launch-1.0 fdsrc ! rawvideoparse ! <encoder> ! h264parse ! mp4mux`.
+One frame per tick, the previous frame repeated if a grab is late, so video time equals
+wall time. Closing the pipe sends EOS and the MP4 trailer is written. GStreamer runs out
+of process; nothing from it or from the NVIDIA stack is linked into the root daemon.
+
+**Privilege.** `cuad` needs `CAP_SYS_ADMIN` for `drmModeGetFB2` and rw `/dev/uinput`. It
+listens on `/run/kmscua/cuad.sock`, mode 0660, group `kmscua`, chowned to the installing
+user via a systemd drop-in so no re-login is needed. Recordings land in
+`/var/lib/kmscua/recordings`, owned by that user.
 
 ## Agent interface (MCP)
 
-The tool surface copies what Claude models were trained on: the flat tool family of
-Anthropic's `computer_toolset_20260801` and Claude Code's own computer-use MCP, with the
-same names, parameter spellings and return conventions. Actions answer `OK`, `screenshot`
-answers with the image only, `cursor_position` answers `X=…, Y=…`, and `computer_batch`
-carries the legacy single-tool action enum and stops at the first failure.
+The tool surface copies the flat tool family of Anthropic's `computer_toolset_20260801`
+and Claude Code's own computer-use MCP: same names, same parameter spellings, same return
+conventions. Actions answer `OK`, `screenshot` answers with the image only,
+`cursor_position` answers `X=…, Y=…`, and `computer_batch` runs the legacy action enum
+and stops at the first failure. Details and the other vendors' shapes:
+[docs/vendor-tool-shapes.md](docs/vendor-tool-shapes.md).
 
 | Tool | Params |
 |---|---|
-| `screenshot` | (optional `settle`) → image only; the image subsequent coordinates refer to |
+| `screenshot` | → image; the image later coordinates refer to |
 | `zoom` | `region: [x0, y0, x1, y1]` → magnified image; coordinates still refer to the full screenshot |
 | `left_click` `right_click` `middle_click` `double_click` `triple_click` | `coordinate: [x, y]`, `text` = modifiers held during the click |
 | `left_click_drag` | `coordinate`, `start_coordinate` (omit = current cursor), `text` |
 | `mouse_move` | `coordinate` |
 | `left_mouse_down` `left_mouse_up` | none |
 | `cursor_position` | none → `X=…, Y=…` |
-| `scroll` | `coordinate` (omit = current cursor), `scroll_direction`, `scroll_amount` (ticks), `text` |
+| `scroll` | `coordinate` (omit = current cursor), `scroll_direction`, `scroll_amount`, `text` |
 | `type` | `text` (ASCII via keyboard, the rest via clipboard) |
 | `key` | `text` xdotool chord, `repeat` |
-| `hold_key` | `text`, `duration` seconds |
+| `hold_key` | `text`, `duration` |
 | `wait` | `duration` → screenshot |
 | `computer_batch` | `actions: [{action, coordinate, start_coordinate, text, scroll_direction, scroll_amount, duration, repeat, region}]` |
 
-Every mutating action also accepts `settle: true` to append the settled screenshot, which
-no vendor tool has. Extras beyond the vendor shape, kept as separate tools so the trained
-vocabulary stays intact:
+Extras that no vendor ships, kept as separate tools so the trained vocabulary stays
+intact. Every mutating action also accepts `settle: true` to append the settled screenshot.
 
-| Tool | What the model gets back |
+| Tool | Returns |
 |---|---|
 | `wait_for_stable {region, quiet_ms, timeout_ms, threshold}` | "settled after 0.9s" or "timed out" + screenshot |
 | `wait_for_change {region, timeout_ms, threshold}` | "changed after 0.4s" or "timed out, no change" + screenshot |
@@ -93,38 +129,38 @@ vocabulary stays intact:
 | `record_frames {path, at[], every, scene, between[i,j], max, max_side}` | stills with timestamps |
 | `record_status`, `doctor` | text |
 
+The model never receives a video. It gets a manifest, stills, and a timeline, which is
+what Playwright traces, browser-use, Cua and the GUI-agent papers converge on. The
+timeline is also written beside the MP4 as `<name>.timeline.jsonl`.
+
 Screenshots default to 1920 px on the long side (`cua mcp --max-side N`), Anthropic's
 documented cost/accuracy balance; the models accept up to 2576 px.
 
-The Codex family (`list_apps`, `get_app_state {app}` returning a numbered accessibility
-tree plus a window screenshot, `click {app, element_index}`, `perform_secondary_action`,
-`set_value`, `select_text`, `press_key`, `type_text`, `scroll {pages}`, `drag {from_x…}`)
-is app-scoped and accessibility-first. It will be a second profile once the AT-SPI layer
-exists; the wire shapes are recorded in the research notes.
+## CLI
 
-## Coordinates
+```
+cua screenshot [-o f] [--max-side N] [--jpeg] [--no-cursor] [--region x,y,w,h]
+cua click X Y [--button right] [--count 2]      cua move X Y
+cua drag X1 Y1 X2 Y2                            cua scroll X Y --dy 3
+cua key ctrl+shift+t                            cua type "hello"
+cua cursor | displays | status | wake | doctor
+cua record start [--name n] [--fps 15] [--max-side 1920] [--max-seconds 600]
+cua record stop [-o out.mp4] | status
+cua record sheet rec.mp4 -o sheet.png --tiles 6
+cua record frames rec.mp4 --scene 0.05 --max 6 --out-dir frames/
+cua mcp [--max-side 1920]
+```
 
-Everything is scanout pixels. The uinput pointer's ABS range equals the union of the
-active displays, so `ABS(x, y)` lands on scanout pixel `(x, y)`, the same pixel the
-screenshot shows. The MCP layer hides even that: coordinates a model passes are pixels
-of the last screenshot it received, and `cua` converts them back.
-
-## Requirements
-
-- Kernel `uinput` (L4T does not ship it; see `~/ThirdParty/rustdesk/uinput-mod` for an
-  out-of-tree build) and a DRM card with an active CRTC (a blanked output captures black;
-  `cua wake` nudges it).
-- Root for `cuad`. The libdrmtap privilege-helper split (`--helper`) is wired but not
-  packaged yet.
-- `wl-clipboard` or `xclip` in the session for non-ASCII typing (clipboard paste).
-- `ffmpeg` on the client side for contact sheets and frame extraction (recording itself
-  does not need it).
+Coordinates on the CLI are scanout pixels. `cuad --check` grabs one frame and creates
+the input devices without serving; `cuad --no-record`, `--record-codec`, `--record-dir`
+control recording.
 
 ## Not yet
 
-- AT-SPI tree (`get_app_state`, click by element index). Planned as a `cua` feature that
-  talks to the session bus found by `session.rs`.
-- Multi-CRTC capture stitched into one image. `displays` lists them; `screenshot` grabs
-  the configured CRTC.
-- xkb-aware typing for non-US layouts (today: US map for ASCII, clipboard for the rest).
-- Packaged helper/setcap mode instead of a root service.
+See [TODO.md](TODO.md). The big one is the Codex profile (app-scoped, accessibility-first,
+`get_app_state` with a numbered AT-SPI tree), which is fully specified and waits on the
+AT-SPI layer.
+
+## License
+
+MIT. `third_party/libdrmtap` is MIT, copyright Mariano Abad; see `LICENSE.libdrmtap`.
