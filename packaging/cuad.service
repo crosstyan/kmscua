@@ -1,0 +1,31 @@
+[Unit]
+Description=kmscua daemon: DRM/KMS capture and uinput injection for agents
+Documentation=https://github.com/crosstyan/kmscua
+After=systemd-udevd.service
+# No dependency on any display manager or compositor: it reads the scanout.
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe uinput
+ExecStart=/usr/local/bin/cuad --socket /run/kmscua/cuad.sock --group kmscua
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=kmscua
+StateDirectory=kmscua
+RuntimeDirectoryMode=0755
+Environment=RUST_LOG=info
+# Set in a drop-in by install.sh so the installing user can connect before re-login:
+#   [Service]
+#   Environment=KMSCUA_OWNER=<user>
+# Root for DRM (CAP_SYS_ADMIN for drmModeGetFB2) and /dev/uinput. Tighten
+# later with the libdrmtap helper split; keep the surface small meanwhile.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Device access is left open on purpose: NVIDIA's EGL on Tegra touches many
+# nodes (/dev/nvgpu/*, /dev/nvhost-*, /dev/nvmap, render nodes) and a closed
+# DevicePolicy broke the EGL detile silently.
+
+[Install]
+WantedBy=multi-user.target

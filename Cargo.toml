@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/proto", "crates/cuad", "crates/cua"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/crosstyan/kmscua"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

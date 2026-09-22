@@ -1,0 +1,38 @@
+diff --git a/src/cursor.c b/src/cursor.c
+index 64e41bf..9ef2b52 100644
+--- a/src/cursor.c
++++ b/src/cursor.c
+@@ -256,6 +256,33 @@ int drmtap_get_cursor(drmtap_ctx *ctx, drmtap_cursor_info *cursor) {
+                         }
+                     }
+                     munmap(mapped, map_size);
++                } else {
++                    /* The scanout BO is not CPU-mappable: Tegra/nvmap keeps it in
++                     * carveout memory and mmap on the exported fd fails with
++                     * ENOSYS. That is the same condition the frame path answers by
++                     * detiling on the GPU, so read the cursor back through EGL as
++                     * well instead of falling through to the helper -- in a direct
++                     * (privileged) context there is no helper, it answers -EACCES,
++                     * and a client that was told the cursor is hidden can then
++                     * never be told it is visible again.
++                     * fb_id 0: a cursor BO is reused for different shapes, so the
++                     * import-once EGLImage cache must not key on it. */
++                    void *egl_data = NULL;
++                    size_t egl_size = 0;
++                    if (drmtap_gpu_egl_convert(ctx, prime_fd, fb2->width, fb2->height,
++                                               stride, fb2->pixel_format, fb2->modifier,
++                                               0, &egl_data, &egl_size) == 0 &&
++                        egl_data != NULL &&
++                        egl_size >= (size_t)fb2->width * fb2->height * 4) {
++                        size_t tight = (size_t)fb2->width * fb2->height * 4;
++                        cursor->pixels = malloc(tight);
++                        if (cursor->pixels) {
++                            memcpy(cursor->pixels, egl_data, tight);
++                        }
++                    } else {
++                        drmtap_debug_log(ctx,
++                            "cursor: EGL readback failed; no pixels for a visible cursor");
++                    }
+                 }
+             }
+             close(prime_fd);

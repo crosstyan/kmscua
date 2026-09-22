@@ -1,0 +1,205 @@
+# libdrmtap — CI Pipeline
+# https://github.com/fxd0h/libdrmtap
+#
+# Builds the library, runs unit tests, and integration tests with vkms.
+# Free and unlimited for public repositories.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege GITHUB_TOKEN: these jobs only check out and build/test.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (Ubuntu ${{ matrix.ubuntu }})
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+    strategy:
+      matrix:
+        ubuntu: ['22.04', '24.04']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build gcc \
+            libdrm-dev \
+            libva-dev libva-drm2 \
+            libseccomp-dev libcap-dev \
+            libegl-dev libgles2-mesa-dev
+          # Try to get vkms module (may not exist on Azure kernel)
+          sudo apt-get install -y linux-modules-extra-$(uname -r) 2>/dev/null || true
+
+      - name: Load vkms (Virtual KMS)
+        continue-on-error: true
+        run: |
+          sudo modprobe vkms || { echo "⚠️ vkms not available on this kernel"; exit 0; }
+          ls -la /dev/dri/
+          # Find the vkms card
+          for card in /dev/dri/card*; do
+            driver=$(basename $(readlink /sys/class/drm/$(basename $card)/device/driver 2>/dev/null) 2>/dev/null || true)
+            echo "$card → driver: $driver"
+            if [ "$driver" = "vkms" ]; then
+              echo "VKMS_DEVICE=$card" >> $GITHUB_ENV
+            fi
+          done
+
+      - name: Build (debug + sanitizers)
+        run: |
+          meson setup build \
+            -Dbuildtype=debug \
+            -Db_sanitize=address,undefined \
+            -Degl=enabled \
+            -Dwerror=true
+          meson compile -C build
+
+      - name: Run unit tests
+        run: meson test -C build --suite unit -v
+
+      - name: Run integration tests
+        if: env.VKMS_DEVICE != ''
+        run: |
+          DRM_DEVICE=${{ env.VKMS_DEVICE }} meson test -C build --suite integration -v
+
+      - name: Build (release, no sanitizers)
+        run: |
+          meson setup build-release \
+            -Dbuildtype=release \
+            -Degl=enabled \
+            -Dwerror=true
+          meson compile -C build-release
+
+      - name: Assert the built .so carries the EGL detile path
+        run: |
+          # -type f on purpose: the versioned .so sits next to meson's
+          # libdrmtap.so.0.4.15.p/ build directory, and a glob matches that too.
+          so="$(find build-release -maxdepth 1 -type f -name 'libdrmtap.so.0.*' | head -1)"
+          test -n "$so" || { echo "::error::no versioned libdrmtap.so in build-release"; exit 1; }
+          echo "checking $so"
+          # EGL is reached by lazy dlopen, on purpose, so that a privileged consumer never links the
+          # vendor GL stack. There is therefore NO DT_NEEDED entry and no undefined egl* symbol to
+          # look for: the obvious ELF check reports "no EGL" on a perfectly good library. What a
+          # stub build really lacks is the dlopen target name and the import call itself.
+          for sym in "libEGL.so.1" "eglCreateImageKHR"; do
+            if ! strings "$so" | grep -qF "$sym"; then
+              echo "::error::$so has no $sym: this is a CPU-only stub, the shipped detile path is missing"
+              exit 1
+            fi
+          done
+          echo "::notice::EGL detile path present in $so"
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build gcc \
+            libdrm-dev libva-dev libva-drm2 \
+            libseccomp-dev libcap-dev \
+            libegl-dev libgles2-mesa-dev \
+            cppcheck
+
+      - name: Build
+        run: |
+          meson setup build -Dbuildtype=debug -Degl=enabled
+          meson compile -C build
+
+      - name: cppcheck
+        run: |
+          cppcheck --enable=warning,style,performance \
+            --suppress=missingIncludeSystem \
+            --suppress=constParameterPointer \
+            --error-exitcode=1 \
+            --inline-suppr \
+            -I include/ \
+            src/ helper/
+
+  rust-crate:
+    name: Rust crate (libdrmtap-sys + libdrmtap)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc pkg-config \
+            libdrm-dev libcap-dev libseccomp-dev \
+            libegl-dev libgles2-mesa-dev
+
+      - name: Build workspace
+        working-directory: bindings/rust
+        run: cargo build --workspace --verbose
+
+      - name: Test workspace
+        working-directory: bindings/rust
+        run: cargo test --workspace --verbose
+
+      # The published crates are the actual distributed artifact (libdrmtap-sys
+      # statically embeds the C sources and builds the privileged helper). Verify
+      # they stay buildable-from-package and publishable.
+      - name: Package check (libdrmtap-sys)
+        working-directory: bindings/rust
+        run: cargo package -p libdrmtap-sys
+
+      - name: Package check (libdrmtap)
+        working-directory: bindings/rust
+        # The wrapper pins the exact libdrmtap-sys version, so on a release that
+        # bumps sys this can only resolve once sys is on crates.io (the -sys crate
+        # is always published first). Defer ONLY when the missing version is the
+        # one this workspace is releasing (wrapper pin == local sys crate version
+        # AND that exact requirement is what cargo could not resolve); any other
+        # packaging or resolution error still fails the job.
+        run: |
+          sys_ver=$(sed -n 's/^version = "\([0-9][0-9.]*\)".*/\1/p' libdrmtap-sys/Cargo.toml | head -1)
+          pin_ver=$(sed -n 's/.*libdrmtap-sys = { version = "\([0-9][0-9.]*\)".*/\1/p' libdrmtap/Cargo.toml | head -1)
+          if out=$(cargo package -p libdrmtap 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            if [ -n "$sys_ver" ] && [ "$pin_ver" = "$sys_ver" ] \
+               && echo "$out" | grep -qF 'failed to select a version for the requirement' \
+               && echo "$out" | grep -qF "libdrmtap-sys = \"^${sys_ver}\""; then
+              echo "::notice::libdrmtap-sys ${sys_ver} not yet on crates.io; wrapper package check deferred until after the sys publish"
+            else
+              exit 1
+            fi
+          fi
+
+  version-coherence:
+    name: Version & crate-source coherence
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # One canonical version (the DRMTAP_VERSION_* macros in include/drmtap.h)
+      # drives every other site via tools/set-version.sh; this gate fails the
+      # build if any of them drift, or if the crate's bundled csrc/ sources no
+      # longer match the library (which once shipped a stale helper). No build
+      # deps needed — just grep/sed/diff.
+      - name: Check version + csrc coherence
+        run: ./tools/check-version.sh

@@ -1,0 +1,24 @@
+[package]
+name = "cua"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kmscua client: CLI and MCP server for agents; talks to cuad and to AT-SPI"
+
+[[bin]]
+name = "cua"
+path = "src/main.rs"
+
+[dependencies]
+kmscua-proto = { path = "../proto" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+schemars = "1.0"
+rmcp = { version = "1.5.0", features = ["transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync"] }
