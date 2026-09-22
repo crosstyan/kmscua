@@ -17,9 +17,10 @@ Measured on a Jetson Orin (GNOME 42 Wayland, 3840x2160, nvidia-drm):
 
 | Operation | Time |
 |---|---|
-| scanout grab with cursor, BGRX to RGBA | 13-20 ms |
-| box downscale 4K to 1080p + PNG | 15-17 ms |
-| same to 1280x720 | 8-11 ms |
+| scanout grab with cursor, BGRX to RGBA | 12-20 ms |
+| downscale 4K to 1920 or 1568 px + PNG | 15-22 ms |
+| downscale to 1280 px + PNG | 9-11 ms |
+| downscale to 2576 px + PNG | 45-50 ms |
 | screen recording | 1080p at 15 fps, hardware H.264, zero dropped frames |
 
 Why this route and not the others: [docs/prior-art.md](docs/prior-art.md).
@@ -71,11 +72,12 @@ docs/          prior art, vendor tool shapes
 **Capture.** `drmtap_grab_mapped` returns the current scanout as tightly packed BGRX (EGL
 detiles block-linear buffers on NVIDIA). The hardware cursor lives on its own KMS plane,
 so it is read separately and composited with premultiplied alpha. Frames are cropped and
-downscaled in-process by an integer box filter (rows split across cores) and encoded to
-PNG (fast zlib level, Sub filter, about 1 MB for a 1080p desktop) or JPEG. `max_side` is
-an upper bound: 3840 becomes 1920 for 1920, 1280 for 1568. The `image` crate's resampler
-was measured at 134 ms for the same 4K to 1080p step (84 ms even for nearest), against
-22 ms for the box filter single-threaded and about 5 ms across 12 cores.
+downscaled in two stages, an integer box filter with rows split across cores for the
+bulk of the reduction and [`fast_image_resize`](https://github.com/Cykooz/fast_image_resize)
+(NEON, rayon) for the residual so `max_side` is exact, then encoded to PNG (fast zlib
+level, Sub filter, about 1 MB for a 1080p desktop) or JPEG. The `image` crate's own
+resampler was measured at 134 ms for 4K to 1080p; see the pipeline table in
+[docs/prior-art.md](docs/prior-art.md#image-pipeline-measured).
 
 **Input.** The pointer is a uinput device with `ABS_X`/`ABS_Y` whose range equals the
 union of the active displays, so `ABS(x, y)` lands on scanout pixel `(x, y)`, the same
@@ -159,6 +161,38 @@ cua mcp [--max-side 1920]
 Coordinates on the CLI are scanout pixels. `cuad --check` grabs one frame and creates
 the input devices without serving; `cuad --no-record`, `--record-codec`, `--record-dir`
 control recording.
+
+## Limitations
+
+- **Pixels only, no window metadata.** kmscua does not know which windows exist, which
+  one has focus, or where they are. Input goes to whatever the compositor thinks is
+  focused, screenshots are the whole scanout, and there is no per-window crop or app
+  scoping. That is what the AT-SPI layer in [TODO.md](TODO.md) adds; until then the
+  model works the way a human at the monitor does.
+- **X11 is not the target.** It works there too (the scanout is below X), but X11 already
+  has `xdotool`, `xwd`, `wmctrl` and XTEST with window awareness; kmscua brings nothing
+  they lack. Use it on X11 only if you want one tool across both.
+- **Needs a real KMS scanout.** Root or `CAP_SYS_ADMIN`, an active CRTC on a DRM card.
+  No headless without a connected display or a dummy plug, no VM guests whose scanout is
+  host-rendered (virgl), no nested compositors, no remote sessions. A blanked output
+  captures black; `cua wake` nudges it.
+- **One CRTC per screenshot.** Multi-monitor is not stitched yet; the input range already
+  spans all displays.
+- **Keyboard layout is US.** ASCII is typed through the virtual keyboard; anything else
+  goes through the clipboard, which needs the session's Wayland or X socket to be
+  discoverable from `/proc` (it is, from an SSH shell, for the same uid).
+- **Compositor shortcuts win.** Super, Alt+Tab and friends are handled by the compositor
+  before any app sees them, the same as for a physical keyboard.
+- **Cursor position is approximate on Tegra.** libdrmtap reports a zero hotspot there,
+  so `cursor_position` is off by the cursor's hotspot (6-14 px scanout), and the plane
+  lags an injected move by one frame.
+- **It is not a sandbox.** Anyone who can connect to the socket controls the seat,
+  including the lock screen and the greeter. The group and the socket mode are the
+  whole boundary. Do not put the socket in a group that untrusted processes share.
+- **Recording has no audio** and depends on GStreamer plus an H.264 element; contact
+  sheets and frame extraction depend on `ffmpeg` on the client side.
+- **Rotated or HDR outputs are untested.** libdrmtap has tone-mapping and the frame
+  comes out in scanout orientation; neither has been exercised here.
 
 ## Not yet
 

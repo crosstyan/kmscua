@@ -21,3 +21,4 @@ env_logger.workspace = true
 libc.workspace = true
 evdev = "0.13.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+fast_image_resize = { version = "5", features = ["rayon"] }

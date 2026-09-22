@@ -227,15 +227,11 @@ impl Capturer {
         let shot = self.grab(with_cursor, region)?;
         let t0 = Instant::now();
         let (sw, sh) = shot.rgba.dimensions();
-        // Integer-factor box downscale, rows split across cores. The image
-        // crate's resampler costs 134 ms for 4K->1080p on the Orin (84 ms even
-        // for Nearest); this is ~22 ms single-threaded and ~5 ms on 12 cores.
-        // `max_side` is therefore an upper bound: 3840 -> 1920 (factor 2),
-        // 1568 -> 1280 (factor 3).
         let (img, scale) = match max_side {
             Some(m) if m > 0 && (sw > m || sh > m) => {
-                let factor = plan_factor(sw.max(sh), m);
-                (downscale_box(&shot.rgba, factor), factor as f32)
+                let img = downscale_to(&shot.rgba, m);
+                let s = sw as f32 / img.width() as f32;
+                (img, s)
             }
             _ => (shot.rgba, 1.0),
         };
@@ -275,13 +271,34 @@ impl Capturer {
     }
 }
 
-/// Smallest integer factor that brings `longest` to at most `max_side`.
-pub fn plan_factor(longest: u32, max_side: u32) -> u32 {
-    let mut f = 1;
-    while longest / f > max_side.max(16) {
-        f += 1;
+/// Downscale so the longest side equals `max_side` (aspect kept).
+///
+/// Two stages, both measured on the Orin for 4K input: an integer box filter
+/// with rows split across cores does the bulk of the reduction (about 5 ms
+/// for 2x), then `fast_image_resize` (NEON, rayon) does the residual
+/// non-integer step on the already small image (a few ms). The image
+/// crate's own resampler took 134 ms for the same 4K -> 1080p.
+pub fn downscale_to(src: &RgbaImage, max_side: u32) -> RgbaImage {
+    let (sw, sh) = src.dimensions();
+    let longest = sw.max(sh);
+    let max_side = max_side.max(16);
+    if longest <= max_side {
+        return src.clone();
     }
-    f
+    let factor = longest / max_side; // floor: stays >= max_side
+    let coarse = if factor > 1 { downscale_box(src, factor) } else { src.clone() };
+    let (cw, ch) = coarse.dimensions();
+    if cw.max(ch) <= max_side {
+        return coarse;
+    }
+    let s = max_side as f32 / cw.max(ch) as f32;
+    let (dw, dh) = (((cw as f32 * s).round() as u32).max(1), ((ch as f32 * s).round() as u32).max(1));
+    use fast_image_resize as fr;
+    let src_img = fr::images::ImageRef::new(cw, ch, coarse.as_raw(), fr::PixelType::U8x4).expect("image ref");
+    let mut dst = fr::images::Image::new(dw, dh, fr::PixelType::U8x4);
+    let opts = fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+    fr::Resizer::new().resize(&src_img, &mut dst, &opts).expect("resize");
+    RgbaImage::from_raw(dw, dh, dst.into_vec()).expect("sized buffer")
 }
 
 /// Box (area-average) downscale by an integer factor, parallel over rows.
