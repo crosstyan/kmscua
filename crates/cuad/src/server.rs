@@ -31,6 +31,9 @@ pub struct RecordConfig {
     pub dir: PathBuf,
     /// uid to chown finished recordings to (the socket owner), if any.
     pub owner_uid: Option<u32>,
+    /// Record through the Jetson zero-copy backend (probed at startup);
+    /// the GStreamer codec, if any, is the fallback.
+    pub zero_copy: bool,
 }
 
 enum CaptureCmd {
@@ -99,6 +102,18 @@ impl CaptureWorker {
         }
         let factor = rec.factor();
         let want_cursor = rec.wants_cursor();
+        if rec.zero_copy() {
+            let shot = self
+                .capture
+                .grab_scanout(want_cursor)
+                .map_err(|e| log::debug!("recorder: grab failed, repeating frame: {e:#}"))
+                .ok();
+            if let Err(e) = rec.push_scanout(shot.as_ref()) {
+                log::warn!("recorder: {e:#}; stopping");
+                self.finish_recording();
+            }
+            return;
+        }
         let frame = match self.capture.grab(want_cursor, None) {
             Ok(shot) => {
                 let mut img = recorder::downscale(&shot.rgba, factor);
@@ -161,6 +176,7 @@ impl CaptureWorker {
             }
             CaptureCmd::Info(reply) => {
                 let codec = match *self.rec.codec.lock().unwrap() {
+                    _ if self.rec.zero_copy => Some(recorder::ZERO_COPY.to_string()),
                     None => Some("detecting".to_string()),
                     Some(c) => c.map(|c| c.name().to_string()),
                 };
@@ -191,7 +207,10 @@ impl CaptureWorker {
                     None => self.last_info.clone().unwrap_or(RecordInfo {
                         recording: false,
                         path: None,
-                        codec: self.codec().map(|c| c.name().to_string()),
+                        codec: match self.rec.zero_copy {
+                            true => Some(recorder::ZERO_COPY.to_string()),
+                            false => self.codec().map(|c| c.name().to_string()),
+                        },
                         width: 0,
                         height: 0,
                         fps: 0,
@@ -216,11 +235,6 @@ impl CaptureWorker {
         max_seconds: u32,
         cursor: bool,
     ) -> Result<RecordInfo> {
-        let codec = match *self.rec.codec.lock().unwrap() {
-            None => bail!("encoder detection still running, retry in a few seconds"),
-            Some(None) => bail!("recording disabled: no usable GStreamer H.264 encoder"),
-            Some(Some(c)) => c,
-        };
         if self.recorder.as_ref().map(|r| r.is_running()).unwrap_or(false) {
             bail!("already recording {}", self.recorder.as_ref().unwrap().path().display());
         }
@@ -241,7 +255,16 @@ impl CaptureWorker {
             max_seconds: max_seconds.clamp(1, 6 * 3600),
             cursor,
         };
-        let rec = Recorder::start(codec, opts)?;
+        let rec = match self.rec.zero_copy {
+            true => match Recorder::start_zero_copy(opts.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("recorder: zero-copy start failed ({e:#}), trying GStreamer");
+                    Recorder::start(self.gst_codec()?, opts)?
+                }
+            },
+            false => Recorder::start(self.gst_codec()?, opts)?,
+        };
         let info = rec.info();
         self.recorder = Some(rec);
         self.last_info = None;
@@ -254,6 +277,14 @@ impl CaptureWorker {
 impl CaptureWorker {
     fn codec(&self) -> Option<Codec> {
         self.rec.codec.lock().unwrap().flatten()
+    }
+
+    fn gst_codec(&self) -> Result<Codec> {
+        match *self.rec.codec.lock().unwrap() {
+            None => bail!("encoder detection still running, retry in a few seconds"),
+            Some(None) => bail!("recording disabled: no usable GStreamer H.264 encoder"),
+            Some(Some(c)) => Ok(c),
+        }
     }
 }
 

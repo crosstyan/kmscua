@@ -45,7 +45,11 @@ Requirements: a DRM card with an active CRTC, kernel `uinput` (L4T ships without
 DKMS-style build is in the TODO), root for `cuad`, `wl-clipboard` or `xclip` in the
 session for non-ASCII typing, `ffmpeg` for contact sheets and frame extraction, and for
 recording a GStreamer H.264 encoder (`nvv4l2h264enc` on Jetson, `nvh264enc`, `x264enc` or
-`openh264enc` elsewhere).
+`openh264enc` elsewhere). On Jetson, `cargo build --release --features cuad/jetson` adds a
+zero-copy recorder that needs no GStreamer: the scanout dma-buf goes through the VIC and NVENC
+(`src/jetson/`), about 10% of one core at 30 fps against well over a full core for the RGBA
+path. It is used when the scanout imports, else recording falls back to GStreamer;
+`--record-codec jetson-zc` forces it.
 
 ## Layout
 
@@ -56,6 +60,7 @@ crates/cuad    root daemon
                input.rs     uinput absolute pointer + keyboard; every request atomic
                keymap.rs    US layout and xdotool key names
                recorder.rs  fixed-rate frame loop into a gst-launch child, MP4 out
+               jetson/      (feature `jetson`) scanout -> VIC -> NVENC shim, minimal MP4 muxer
                server.rs    unix socket loop + capture worker thread
 crates/cua     client
                main.rs      CLI

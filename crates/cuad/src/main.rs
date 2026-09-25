@@ -6,6 +6,8 @@
 
 mod capture;
 mod input;
+#[cfg(feature = "jetson")]
+mod jetson;
 mod keymap;
 mod recorder;
 mod server;
@@ -49,7 +51,8 @@ struct Args {
     /// encoder is present).
     #[arg(long)]
     no_record: bool,
-    /// Force an encoder: nvv4l2h264enc (Jetson), nvh264enc (NVENC), x264enc, openh264enc.
+    /// Force an encoder: jetson-zc (Jetson zero-copy, needs the `jetson` build
+    /// feature), nvv4l2h264enc (Jetson), nvh264enc (NVENC), x264enc, openh264enc.
     #[arg(long, env = "KMSCUA_RECORD_CODEC")]
     record_codec: Option<String>,
     /// Where recordings are written.
@@ -82,7 +85,14 @@ fn main() -> Result<()> {
     // the startup path; recording requests before it finishes are refused
     // with "detecting".
     let codec_slot: server::CodecSlot = Default::default();
-    if !args.no_record {
+    let zero_copy = !args.no_record && recorder::zero_copy_probe(&mut capture, args.record_codec.as_deref());
+    if zero_copy {
+        log::info!("recording: {} (VIC + NVENC from the scanout dma-buf) -> {}", recorder::ZERO_COPY, args.record_dir.display());
+    }
+    if args.record_codec.as_deref() == Some(recorder::ZERO_COPY) {
+        // Forced: no GStreamer fallback, and no gst-inspect run.
+        *codec_slot.lock().unwrap() = Some(None);
+    } else if !args.no_record {
         let slot = codec_slot.clone();
         let preferred = args.record_codec.clone();
         let dir = args.record_dir.clone();
@@ -114,6 +124,7 @@ fn main() -> Result<()> {
         codec: codec_slot,
         dir: args.record_dir.clone(),
         owner_uid,
+        zero_copy,
     };
     let mut daemon = server::Daemon::new(capture, input, rec);
 

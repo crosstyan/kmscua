@@ -22,3 +22,13 @@ libc.workspace = true
 evdev = "0.13.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 fast_image_resize = { version = "5", features = ["rayon"] }
+
+[features]
+# Jetson (L4T) zero-copy recording: scanout dma-buf -> VIC -> NVENC, no
+# GStreamer. Needs the Jetson Multimedia API headers and the L4T NvBufSurface
+# and libv4l2 libraries at build time; falls back to GStreamer at run time
+# when the scanout cannot be imported.
+jetson = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }

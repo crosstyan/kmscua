@@ -32,6 +32,16 @@ pub struct Shot {
     pub grab_ms: f32,
 }
 
+/// The scanout as a dma-buf, for consumers that read it on the device
+/// (the Jetson zero-copy recorder). The cursor plane comes along separately.
+#[cfg_attr(not(feature = "jetson"), allow(dead_code))]
+pub struct Scanout {
+    pub frame: libdrmtap::Frame,
+    /// Cursor position and premultiplied ARGB8888 pixels, when visible.
+    pub cursor: Option<(CursorInfo, Vec<u32>)>,
+    pub grabbed: Instant,
+}
+
 impl Capturer {
     pub fn open(device: Option<String>, crtc_id: u32, helper: Option<String>) -> Result<Self> {
         let cfg = Config {
@@ -213,6 +223,33 @@ impl Capturer {
             cursor,
             grab_ms: t0.elapsed().as_secs_f32() * 1000.0,
         })
+    }
+
+    /// Grab the scanout as a dma-buf without mapping or converting it.
+    pub fn grab_scanout(&mut self, with_cursor: bool) -> Result<Scanout> {
+        let grabbed = Instant::now();
+        let frame = self.tap.grab().map_err(|e| anyhow!("grab: {e}"))?;
+        if frame.dma_buf_fd() < 0 {
+            bail!("capture path returned no dma-buf");
+        }
+        let cursor = if with_cursor {
+            self.tap.get_cursor().ok().and_then(|c| {
+                let px = c.pixels().filter(|_| c.visible())?.to_vec();
+                let info = CursorInfo {
+                    visible: true,
+                    x: c.x(),
+                    y: c.y(),
+                    hot_x: c.hot_x(),
+                    hot_y: c.hot_y(),
+                    width: c.width(),
+                    height: c.height(),
+                };
+                Some((info, px))
+            })
+        } else {
+            None
+        };
+        Ok(Scanout { frame, cursor, grabbed })
     }
 
     /// Grab and encode. `max_side` bounds the longest side of the result.
