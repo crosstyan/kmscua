@@ -6,7 +6,23 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 user="${1:-${SUDO_USER:-$(id -un)}}"
 
 git -C "$here" submodule update --init
-cargo build --release --manifest-path "$here/Cargo.toml"
+
+# Jetson (L4T): add the zero-copy recorder (feature cuad/jetson), which needs the Jetson
+# Multimedia API headers. KMSCUA_NO_JETSON=1 builds without it.
+features=""
+mmapi="${JETSON_MMAPI_INCLUDE:-/usr/src/jetson_multimedia_api/include}"
+if [ -z "${KMSCUA_NO_JETSON:-}" ] && { [ -e /etc/nv_tegra_release ] ||
+    tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | grep -q '^nvidia,tegra'; }; then
+    if [ -e "$mmapi/nvbufsurface.h" ]; then
+        features="--features cuad/jetson"
+        echo "Jetson detected: building with the zero-copy recorder (cuad/jetson)."
+    else
+        echo "Jetson detected, but $mmapi/nvbufsurface.h is missing (package" \
+            "nvidia-l4t-jetson-multimedia-api); recording will use GStreamer." >&2
+    fi
+fi
+# shellcheck disable=SC2086 # $features is empty or two words
+cargo build --release --manifest-path "$here/Cargo.toml" $features
 
 sudo install -m755 "$here/target/release/cuad" /usr/local/bin/cuad
 sudo install -m755 "$here/target/release/cua" /usr/local/bin/cua

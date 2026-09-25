@@ -28,7 +28,7 @@ Why this route and not the others: [docs/prior-art.md](docs/prior-art.md).
 ## Install
 
 ```
-packaging/install.sh                # builds, installs, creates group kmscua, enables cuad.service
+packaging/install.sh                # builds (on Jetson with cuad/jetson), installs, creates group kmscua, enables cuad.service
 cua doctor                          # everything should say true
 cua screenshot -o shot.png --max-side 1280
 cua click 1920 24 && cua key escape
