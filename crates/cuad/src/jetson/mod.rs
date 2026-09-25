@@ -154,11 +154,10 @@ impl Drop for Surface {
 /// NvMM takes the lowest free numbers, so imports stay clear of them up here.
 fn dup(fd: i32) -> Result<OwnedFd> {
     const IMPORT_FD_BASE: i32 = 512;
-    let mut n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, IMPORT_FD_BASE) };
-    if n < 0 {
-        // RLIMIT_NOFILE below the base: take any number.
-        n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    }
+    // No fallback below the base: those are exactly the numbers that can resolve to a stale
+    // surface. With RLIMIT_NOFILE at or under the base the import fails and recording falls
+    // back to the GStreamer path.
+    let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, IMPORT_FD_BASE) };
     if n < 0 {
         bail!("dup dma-buf: {}", std::io::Error::last_os_error());
     }

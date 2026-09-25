@@ -190,6 +190,7 @@ typedef struct jz_enc {
     int fd;
     void *cap[JZ_NCAP];
     size_t cap_len[JZ_NCAP];
+    int cap_fd[JZ_NCAP];
 } jz_enc;
 
 static int ctrl(jz_enc *e, uint32_t id, int32_t value) {
@@ -226,8 +227,10 @@ void jz_enc_close(jz_enc *e) {
         t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         v4l2_ioctl(e->fd, VIDIOC_STREAMOFF, &t);
     }
-    for (int i = 0; i < JZ_NCAP; i++)
+    for (int i = 0; i < JZ_NCAP; i++) {
         if (e->cap[i]) munmap(e->cap[i], e->cap_len[i]);
+        if (e->cap_fd[i] >= 0) close(e->cap_fd[i]);
+    }
     if (e->fd >= 0) v4l2_close(e->fd);
     free(e);
 }
@@ -239,6 +242,7 @@ jz_enc *jz_enc_open(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate, uint
     jz_enc *e = calloc(1, sizeof *e);
     if (!e) return NULL;
     e->fd = -1;
+    for (int i = 0; i < JZ_NCAP; i++) e->cap_fd[i] = -1;
     if (nout < 1 || nout > JZ_MAX_OUT) {
         errno = EINVAL;
         set_err(err, errlen, "nout");
@@ -333,10 +337,12 @@ jz_enc *jz_enc_open(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate, uint
             set_err(err, errlen, "EXPBUF");
             goto fail;
         }
-        // libnvv4l2 maps capture buffers through the exported fd; v4l2_mmap fails.
+        // libnvv4l2 maps capture buffers through the exported fd; v4l2_mmap fails. The fd
+        // stays open until close: NvBufSurface resolves buffers by fd number, so a surface
+        // allocated or imported later on this recycled number would be taken for this buffer.
+        e->cap_fd[i] = eb.fd;
         void *m = mmap(NULL, pl[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, eb.fd,
                        pl[0].m.mem_offset);
-        close(eb.fd);
         if (m == MAP_FAILED) {
             set_err(err, errlen, "mmap capture");
             goto fail;
