@@ -15,7 +15,9 @@
 //! also accepts an optional `settle` flag that appends the settled screenshot.
 //!
 //! Coordinates a model passes are pixels of the last full `screenshot`; this
-//! layer converts them to scanout pixels. `zoom` never changes that space.
+//! layer converts them to desktop pixels. `zoom` never changes that space.
+//! `switch_display` narrows the full screenshot to one monitor; the daemon's
+//! `origin` in each reply keeps the conversion right either way.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use kmscua_proto::{
-    Button, Client, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo,
+    Button, Client, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo, Status,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -40,14 +42,15 @@ use crate::{atspi, video};
 const DEFAULT_MAX_SIDE: u32 = 1920;
 const NOT_EXECUTED: &str = "Not executed: an earlier computer action in this turn failed.";
 
-/// Scale and origin of the last full screenshot: image px -> scanout px.
+/// Scale and origin of the last full screenshot: image px -> desktop px.
 #[derive(Clone, Copy)]
 struct View {
     scale: f32,
     ox: i32,
     oy: i32,
-    /// Scanout size the screenshot was taken from (0 before the first shot).
+    /// Desktop size the screenshot was taken from (0 before the first shot).
     src_w: u32,
+    #[allow(dead_code)]
     src_h: u32,
 }
 
@@ -73,6 +76,9 @@ const EXTRA_TOOLS: &[&str] = &[
 pub struct CuaServer {
     client: Arc<Client>,
     view: Arc<Mutex<View>>,
+    /// The monitor `switch_display` selected: full screenshots crop to it.
+    /// None = the whole desktop.
+    focus: Arc<Mutex<Option<Rect>>>,
     rec: Arc<Mutex<Option<RecState>>>,
     last_rec: Arc<Mutex<Option<PathBuf>>>,
     ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
@@ -172,6 +178,13 @@ pub struct HoldKeyParams {
 pub struct WaitParams {
     /// Seconds to wait, 0-100.
     pub duration: f32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SwitchDisplayParams {
+    /// Connector name as `doctor` lists it ("DP-2", "HDMI-A-1"), "primary",
+    /// or "all" for the whole desktop again.
+    pub display: String,
 }
 
 /// One item of `computer_batch`: the legacy single-tool action schema.
@@ -337,9 +350,11 @@ impl CuaServer {
         Ok((c.x + c.hot_x, c.y + c.hot_y))
     }
 
-    /// Full screenshot. Updates the coordinate view. Image only.
+    /// Full screenshot (of the focused display, if one is selected). Updates
+    /// the coordinate view. Image only.
     async fn shot_full(&self) -> Result<Content, ErrorData> {
         let max_side = self.max_side;
+        let region = *self.focus.lock().unwrap();
         let reply = self
             .blocking(move |c| {
                 c.call(&Request::Screenshot {
@@ -347,7 +362,7 @@ impl CuaServer {
                     format: ImageFormat::Png,
                     quality: None,
                     cursor: Some(true),
-                    region: None,
+                    region,
                 })
             })
             .await?;
@@ -665,6 +680,7 @@ impl CuaServer {
         Self {
             client: Arc::new(client),
             view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0, src_w: 0, src_h: 0 })),
+            focus: Arc::new(Mutex::new(None)),
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
             ui: Arc::new(tokio::sync::Mutex::new(None)),
@@ -803,6 +819,38 @@ impl CuaServer {
         let secs = p.duration.clamp(0.0, 100.0);
         tokio::time::sleep(Duration::from_secs_f32(secs)).await;
         self.mark(format!("wait {secs}s"));
+        Ok(CallToolResult::success(vec![self.shot_full().await?]))
+    }
+
+    #[tool(
+        name = "switch_display",
+        description = "Restrict screenshots to one monitor (by connector name as doctor lists them, or \"primary\"), or pass \"all\" to see the whole desktop again. Returns a screenshot of the selection; coordinates you pass afterwards are pixels of that screenshot. Use it when a window lives on a side monitor that is small in the full-desktop view."
+    )]
+    async fn switch_display(&self, Parameters(p): Parameters<SwitchDisplayParams>) -> Result<CallToolResult, ErrorData> {
+        let want = p.display.trim();
+        let status: Status = self.blocking(|c| c.call(&Request::Status)?.data()).await?;
+        let placed: Vec<_> = status.displays.iter().filter(|d| d.desktop.is_some()).collect();
+        let chosen = if want.eq_ignore_ascii_case("all") {
+            None
+        } else if want.eq_ignore_ascii_case("primary") {
+            Some(placed.iter().find(|d| (d.scale - 1.0).abs() < 1e-3).or(placed.first()).ok_or_else(|| bad("no display is placed"))?.desktop)
+        } else {
+            let key = want.to_ascii_uppercase().replace("HDMI-A-", "HDMI-");
+            Some(
+                placed
+                    .iter()
+                    .find(|d| d.name.to_ascii_uppercase().replace("HDMI-A-", "HDMI-") == key)
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "no placed display named {want}; available: {}, primary, all",
+                            placed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ))
+                    })?
+                    .desktop,
+            )
+        };
+        *self.focus.lock().unwrap() = chosen.flatten();
+        self.mark(format!("switch_display {want}"));
         Ok(CallToolResult::success(vec![self.shot_full().await?]))
     }
 
@@ -973,19 +1021,16 @@ impl CuaServer {
             Some(s) => (s.started_wall, s.timeline.clone()),
             None => (SystemTime::now() - Duration::from_secs_f32(info.seconds.max(0.0)), Vec::new()),
         };
-        let source = {
-            let v = *self.view.lock().unwrap();
-            if v.src_w > 0 {
-                (v.src_w, v.src_h)
-            } else {
-                self.blocking(|c| c.call(&Request::Status))
-                    .await
-                    .ok()
-                    .and_then(|r| r.data::<kmscua_proto::Status>().ok())
-                    .map(|s| (s.desktop.width, s.desktop.height))
-                    .unwrap_or((0, 0))
-            }
-        };
+        // The recording covers the whole desktop even when screenshots are
+        // focused on one display, so the manifest's source size comes from
+        // the daemon, not the view.
+        let source = self
+            .blocking(|c| c.call(&Request::Status))
+            .await
+            .ok()
+            .and_then(|r| r.data::<Status>().ok())
+            .map(|s| (s.desktop.width, s.desktop.height))
+            .unwrap_or((0, 0));
         let manifest = video::manifest_from(&info, started_wall, source, &timeline);
         let _ = video::write_manifest(&path, &manifest);
         lines[0].push_str(&format!(" | started {} | manifest {}", manifest.started_at, video::manifest_path(&path).display()));
@@ -1141,12 +1186,19 @@ impl ServerHandler for CuaServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("kmscua", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
+                "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. The screenshot shows every monitor side by side as the desktop is arranged; switch_display narrows it to one monitor and back to all. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
             )
     }
 }
 
 pub async fn serve(client: Client, max_side: Option<u32>, core_only: bool) -> anyhow::Result<()> {
+    // The daemon cannot see how the monitors are arranged; tell it before
+    // the model's first screenshot. Best effort: with one monitor, or on a
+    // compositor we cannot ask yet, the single-display default still works.
+    match crate::layout::push(&client).await {
+        Ok(s) => log::info!("layout pushed:\n{}", crate::layout::describe(&s)),
+        Err(e) => log::warn!("layout not pushed ({e:#}); capturing the first display only"),
+    }
     let server = CuaServer::new(client, max_side.unwrap_or(DEFAULT_MAX_SIDE), core_only);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;

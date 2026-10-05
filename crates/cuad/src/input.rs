@@ -1,9 +1,12 @@
 //! Virtual input through uinput: one absolute pointer and one keyboard,
-//! created once at daemon start and kept for the daemon's lifetime.
+//! created at daemon start and kept for the daemon's lifetime. The pointer
+//! is rebuilt when the desktop rect changes (a layout push or a hotplug).
 //!
-//! The pointer's `ABS_X`/`ABS_Y` range equals the scanout union rect, so
-//! `ABS(x, y)` lands at scanout pixel `(x, y)`: the same space the screenshot
-//! is in. Compositors map an absolute device across the whole desktop.
+//! The pointer's `ABS_X`/`ABS_Y` range equals the desktop rect, so
+//! `ABS(x, y)` lands at desktop pixel `(x, y)`: the same space the screenshot
+//! is in. Compositors map an absolute device linearly across the whole
+//! logical desktop, which is why desktop space has to be a uniform scaling of
+//! the compositor's layout (see `capture.rs`) and why the range must track it.
 //!
 //! Every public method is atomic: whatever it presses, it releases before it
 //! returns, including on error. Another virtual device (a RustDesk session,
@@ -55,36 +58,7 @@ impl Input {
 
     pub fn create(desktop: Rect, seat: Option<&str>) -> Result<Self> {
         let (pointer_name, keyboard_name) = device_names(seat);
-        let w = desktop.width.max(1) as i32;
-        let h = desktop.height.max(1) as i32;
-        let abs_x = UinputAbsSetup::new(
-            AbsoluteAxisCode::ABS_X,
-            AbsInfo::new(0, desktop.x, desktop.x + w - 1, 0, 0, 0),
-        );
-        let abs_y = UinputAbsSetup::new(
-            AbsoluteAxisCode::ABS_Y,
-            AbsInfo::new(0, desktop.y, desktop.y + h - 1, 0, 0, 0),
-        );
-        let buttons = AttributeSet::from_iter([
-            KeyCode::BTN_LEFT,
-            KeyCode::BTN_RIGHT,
-            KeyCode::BTN_MIDDLE,
-            KeyCode::BTN_SIDE,
-            KeyCode::BTN_EXTRA,
-        ]);
-        let wheels =
-            AttributeSet::from_iter([RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_HWHEEL]);
-        let props = AttributeSet::from_iter([PropType::DIRECT]);
-        let pointer = VirtualDevice::builder()
-            .context("uinput builder (is /dev/uinput present and writable?)")?
-            .name(&pointer_name)
-            .with_properties(&props)?
-            .with_absolute_axis(&abs_x)?
-            .with_absolute_axis(&abs_y)?
-            .with_relative_axes(&wheels)?
-            .with_keys(&buttons)?
-            .build()
-            .context("create uinput absolute pointer")?;
+        let pointer = build_pointer(&pointer_name, desktop)?;
 
         // KEY_ESC..=KEY_MICMUTE: every keyboard key including media keys, and
         // nothing from the BTN_* ranges. Advertising joystick buttons makes
@@ -116,6 +90,31 @@ impl Input {
 
     pub fn desktop(&self) -> Rect {
         self.desktop
+    }
+
+    /// Rebuild the pointer for a new desktop rect. The ABS range is fixed at
+    /// device creation, so this is a new uinput device; the compositor binds
+    /// it like a freshly plugged mouse (the same ~600 ms as at start). The
+    /// keyboard is untouched. No-op when the rect is unchanged.
+    pub fn set_desktop(&mut self, desktop: Rect) -> Result<()> {
+        if desktop == self.desktop {
+            return Ok(());
+        }
+        for b in [Button::Left, Button::Right, Button::Middle] {
+            let _ = self.button(b, false);
+        }
+        let pointer = build_pointer(&self.names.0, desktop)?;
+        self.pointer = pointer;
+        self.desktop = desktop;
+        sleep(Duration::from_millis(600));
+        log::info!(
+            "pointer range now {}x{} at ({},{})",
+            desktop.width,
+            desktop.height,
+            desktop.x,
+            desktop.y
+        );
+        Ok(())
     }
 
     fn clamp(&self, x: i32, y: i32) -> (i32, i32) {
@@ -364,6 +363,39 @@ impl Input {
             .keyboard
             .emit(&[InputEvent::new_now(EventType::SYNCHRONIZATION.0, SYN, 0)]);
     }
+}
+
+fn build_pointer(name: &str, desktop: Rect) -> Result<VirtualDevice> {
+    let w = desktop.width.max(1) as i32;
+    let h = desktop.height.max(1) as i32;
+    let abs_x = UinputAbsSetup::new(
+        AbsoluteAxisCode::ABS_X,
+        AbsInfo::new(0, desktop.x, desktop.x + w - 1, 0, 0, 0),
+    );
+    let abs_y = UinputAbsSetup::new(
+        AbsoluteAxisCode::ABS_Y,
+        AbsInfo::new(0, desktop.y, desktop.y + h - 1, 0, 0, 0),
+    );
+    let buttons = AttributeSet::from_iter([
+        KeyCode::BTN_LEFT,
+        KeyCode::BTN_RIGHT,
+        KeyCode::BTN_MIDDLE,
+        KeyCode::BTN_SIDE,
+        KeyCode::BTN_EXTRA,
+    ]);
+    let wheels =
+        AttributeSet::from_iter([RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_HWHEEL]);
+    let props = AttributeSet::from_iter([PropType::DIRECT]);
+    VirtualDevice::builder()
+        .context("uinput builder (is /dev/uinput present and writable?)")?
+        .name(name)
+        .with_properties(&props)?
+        .with_absolute_axis(&abs_x)?
+        .with_absolute_axis(&abs_y)?
+        .with_relative_axes(&wheels)?
+        .with_keys(&buttons)?
+        .build()
+        .context("create uinput absolute pointer")
 }
 
 fn button_code(b: Button) -> u16 {

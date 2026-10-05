@@ -5,8 +5,12 @@
 //! of JSON. A response may carry a binary payload after its JSON header; the
 //! header's `bytes` field says how many bytes follow.
 //!
-//! Every coordinate in this protocol is a scanout pixel: the same space the
-//! screenshot is in. There is no logical/physical scale anywhere.
+//! Every coordinate in this protocol is a desktop pixel: the same space the
+//! screenshot is in. With one display, desktop pixels are its scanout pixels.
+//! With several, the daemon places each display's scanout in one desktop
+//! space ([`DisplayInfo::desktop`]) using the layout `SetLayout` pushes to it;
+//! the primary display stays 1:1 and the others are resampled by their own
+//! factor. There is no logical/physical scale anywhere else.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -75,11 +79,11 @@ pub enum Request {
         /// Composite the cursor (default true).
         #[serde(default)]
         cursor: Option<bool>,
-        /// Crop to this scanout rect before resizing.
+        /// Crop to this desktop rect before resizing.
         #[serde(default)]
         region: Option<Rect>,
     },
-    /// Where the hardware cursor is right now, in scanout pixels.
+    /// Where the hardware cursor is right now, in desktop pixels.
     Cursor,
     PointerMove {
         x: i32,
@@ -174,6 +178,32 @@ pub enum Request {
     /// Stop the recording and finalize the file.
     RecordStop,
     RecordStatus,
+    /// Tell the daemon how the compositor arranges the displays. DRM only
+    /// knows each CRTC's mode; where a monitor sits next to another, and at
+    /// what scale, lives in the compositor. `cua layout` reads it there and
+    /// pushes it here. An empty list resets to the single-display default.
+    SetLayout {
+        monitors: Vec<LayoutMonitor>,
+    },
+}
+
+/// One monitor of the compositor's layout, as a rectangle in the
+/// compositor's logical space. Only the rectangles' proportions and
+/// positions relative to each other matter: the daemon rescales the whole
+/// layout so the primary display is 1:1 with its scanout, so the same
+/// numbers work whether they come from Mutter (logical pixels) or from
+/// xrandr under Xwayland (a uniform multiple of them).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LayoutMonitor {
+    /// Connector name as the compositor spells it ("HDMI-1", "DP-2"); the
+    /// daemon normalizes it against the kernel's spelling ("HDMI-A-1").
+    pub connector: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,12 +234,29 @@ pub struct DisplayInfo {
     pub name: String,
     pub crtc_id: u32,
     pub connector_id: u32,
+    /// CRTC offset into its framebuffer. Compositors give every CRTC its own
+    /// framebuffer, so this is 0 and says nothing about the desktop layout;
+    /// `desktop` does.
     pub x: u32,
     pub y: u32,
+    /// Current mode, in scanout pixels.
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
     pub active: bool,
+    /// Where this display sits in desktop space (the space screenshots and
+    /// input coordinates are in). None: not placed, so not captured and not
+    /// reachable by the pointer, until a layout places it.
+    #[serde(default)]
+    pub desktop: Option<Rect>,
+    /// Scanout pixels per desktop pixel: 1.0 for the primary display, the
+    /// ratio of the two displays' pixel densities for the others.
+    #[serde(default = "one_f32")]
+    pub scale: f32,
+}
+
+fn one_f32() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,12 +276,13 @@ pub struct ScreenshotInfo {
     /// Size of the returned image.
     pub width: u32,
     pub height: u32,
-    /// Size of the scanout region the image was taken from. Multiply an image
-    /// coordinate by `scale` to get a scanout coordinate.
+    /// Size of the desktop region the image was taken from. Multiply an image
+    /// coordinate by `scale` to get a desktop coordinate.
     pub source_width: u32,
     pub source_height: u32,
     pub scale: f32,
-    /// Scanout offset of the region (0,0 for a full-screen shot).
+    /// Desktop offset of the region (the desktop rect's origin for a
+    /// full-screen shot).
     pub origin_x: i32,
     pub origin_y: i32,
     pub mime: String,
@@ -249,8 +297,12 @@ pub struct Status {
     pub uptime_s: u64,
     pub gpu_driver: Option<String>,
     pub displays: Vec<DisplayInfo>,
-    /// Union rect of all active displays; the uinput ABS range.
+    /// Union rect of the placed displays in desktop space; the uinput ABS range.
     pub desktop: Rect,
+    /// Where the layout came from: "compositor" after `SetLayout`, None for
+    /// the single-display default (only the primary CRTC is placed).
+    #[serde(default)]
+    pub layout: Option<String>,
     pub pointer_device: String,
     pub keyboard_device: String,
     pub cursor_supported: bool,

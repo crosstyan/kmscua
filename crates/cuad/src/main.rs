@@ -1,8 +1,10 @@
 //! cuad: the privileged half of kmscua.
 //!
 //! Runs as root (or with CAP_SYS_ADMIN for the DRM side and rw /dev/uinput).
-//! Owns one libdrmtap context and two uinput devices for its whole lifetime,
-//! and answers requests on a unix socket. It never talks to a compositor.
+//! Owns one libdrmtap context per active CRTC and two uinput devices for its
+//! whole lifetime, and answers requests on a unix socket. It never talks to
+//! a compositor: the one thing only the compositor knows, how the monitors
+//! are arranged, the client reads there and pushes here (`cua layout`).
 
 mod capture;
 mod input;
@@ -36,7 +38,8 @@ struct Args {
     /// DRM device (default: auto-detect the card with an active CRTC).
     #[arg(long)]
     device: Option<String>,
-    /// CRTC id to capture (default: first active).
+    /// Capture only this CRTC (default: every active one, arranged by the
+    /// layout `cua layout` pushes; until then only the first is captured).
     #[arg(long, default_value_t = 0)]
     crtc: u32,
     /// libdrmtap privilege helper, for running without CAP_SYS_ADMIN.
@@ -58,6 +61,10 @@ struct Args {
     /// Where recordings are written.
     #[arg(long, default_value = "/var/lib/kmscua/recordings", env = "KMSCUA_RECORD_DIR")]
     record_dir: PathBuf,
+    /// Where the last pushed monitor layout is kept, so it survives a
+    /// daemon restart. It is re-checked against the connected displays.
+    #[arg(long, default_value = "/var/lib/kmscua/layout.json", env = "KMSCUA_LAYOUT_FILE")]
+    layout_file: PathBuf,
     /// Probe capture and input, print status JSON, exit.
     #[arg(long)]
     check: bool,
@@ -69,6 +76,17 @@ fn main() -> Result<()> {
 
     let mut capture = capture::Capturer::open(args.device.clone(), args.crtc, args.helper.clone())
         .context("open DRM capture")?;
+    match server::load_layout(&args.layout_file) {
+        Ok(Some(monitors)) => match capture.set_layout(monitors) {
+            Ok(_) => log::info!("layout restored from {}", args.layout_file.display()),
+            Err(e) => log::warn!(
+                "saved layout {} does not fit the connected displays ({e:#}); single-display default until `cua layout` runs",
+                args.layout_file.display()
+            ),
+        },
+        Ok(None) => {}
+        Err(e) => log::warn!("ignoring {}: {e:#}", args.layout_file.display()),
+    }
     let desktop = capture.desktop_rect().context("determine desktop rect")?;
     log::info!(
         "desktop {}x{} at ({},{}), gpu driver {:?}, cursor {}",
@@ -126,7 +144,7 @@ fn main() -> Result<()> {
         owner_uid,
         zero_copy,
     };
-    let mut daemon = server::Daemon::new(capture, input, rec);
+    let mut daemon = server::Daemon::new(capture, input, rec, args.layout_file.clone());
 
     if args.check {
         let (info, bytes) = daemon.screenshot(Some(1280))?;

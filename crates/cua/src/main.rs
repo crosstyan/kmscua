@@ -6,6 +6,7 @@
 //! session environment itself, so it also works from an SSH shell.
 
 mod atspi;
+mod layout;
 mod mcp;
 mod session;
 mod video;
@@ -36,6 +37,17 @@ enum Cmd {
     Status,
     /// Connected displays.
     Displays,
+    /// Read the monitor arrangement from the compositor (GNOME) and push it
+    /// to cuad, so screenshots and input cover every monitor. The MCP
+    /// server does this at start; run it by hand after rearranging monitors.
+    Layout {
+        /// Forget the layout: back to capturing the first display only.
+        #[arg(long)]
+        clear: bool,
+        /// Print the layout as read from the compositor without pushing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Save a screenshot.
     Screenshot {
         #[arg(short, long, default_value = "screenshot.png")]
@@ -240,6 +252,20 @@ fn main() -> Result<()> {
         }
         Cmd::Status => print_json(&c.call(&Request::Status)?.header.data),
         Cmd::Displays => print_json(&c.call(&Request::Displays)?.header.data),
+        Cmd::Layout { clear, dry_run } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            if *dry_run {
+                let monitors = rt.block_on(layout::query_mutter())?;
+                return print_json(&serde_json::to_value(monitors)?);
+            }
+            let status = if *clear {
+                rt.block_on(layout::set(&c, Vec::new()))?
+            } else {
+                rt.block_on(layout::push(&c))?
+            };
+            println!("{}", layout::describe(&status));
+            Ok(())
+        }
         Cmd::Screenshot {
             out,
             max_side,
@@ -603,6 +629,13 @@ pub fn doctor(c: &Client) -> Doctor {
         }
         if d.displays.iter().all(|d| !d.active) {
             notes.push("no active display: outputs are blanked, try `cua wake`".into());
+        }
+        let active = d.displays.iter().filter(|d| d.active).count();
+        if active > 1 && d.layout.is_none() {
+            let shown = d.displays.iter().find(|d| d.desktop.is_some()).map(|d| d.name.as_str()).unwrap_or("?");
+            notes.push(format!(
+                "{active} active displays but no layout: only {shown} is captured and pointer coordinates are off on every monitor; run `cua layout` (GNOME) to fix both"
+            ));
         }
     }
     Doctor {

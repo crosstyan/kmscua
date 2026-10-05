@@ -67,6 +67,7 @@ crates/cua     client
                mcp.rs       MCP server (rmcp), coordinate mapping, wait/record extras
                video.rs     ffmpeg contact sheets, frames, scene changes, timeline sidecar
                session.rs   finds the user's Wayland/X/D-Bus env from /proc
+               layout.rs    reads the monitor arrangement from Mutter, pushes it to cuad
 third_party/libdrmtap   vendored MIT library with the Tegra cursor EGL fallback patch
 packaging/     systemd unit + install script
 docs/          prior art, vendor tool shapes
@@ -98,6 +99,22 @@ One frame per tick, the previous frame repeated if a grab is late, so video time
 wall time. Closing the pipe sends EOS and the MP4 trailer is written. GStreamer runs out
 of process; nothing from it or from the NVIDIA stack is linked into the root daemon.
 
+**Several monitors.** DRM knows each CRTC's mode and nothing about where the monitors
+sit next to each other or at what scale; compositors give every CRTC its own
+framebuffer, so all of them report offset (0,0). The arrangement lives in the compositor,
+and that is the one thing `cua` asks it for: `cua layout` reads Mutter's `DisplayConfig`
+over D-Bus and pushes the logical rectangles to `cuad` (the MCP server does this at
+start). From them the daemon builds one *desktop space*: the primary monitor 1:1 with its
+scanout, every other monitor resampled by the ratio of the two pixel densities, placed
+where the compositor puts it. A screenshot grabs every CRTC the region touches and
+stitches them; the pointer's ABS range is the desktop rect. That works because
+compositors map an absolute device linearly across the whole logical desktop, so
+`ABS(x, y)` lands on desktop pixel `(x, y)` on every monitor at once. Only the layout's
+proportions matter, which is why the same numbers would work from xrandr too. With one
+monitor, or before a layout arrives, desktop space is the first scanout and nothing
+changes. `switch_display` crops screenshots to one monitor when a window on a small side
+monitor needs more pixels. GNOME only so far; rotated outputs are refused with a message.
+
 **Privilege.** `cuad` needs `CAP_SYS_ADMIN` for `drmModeGetFB2` and rw `/dev/uinput`. It
 listens on `/run/kmscua/cuad.sock`, mode 0660, group `kmscua`, chowned to the installing
 user via a systemd drop-in so no re-login is needed. Recordings land in
@@ -127,6 +144,7 @@ and stops at the first failure. Details and the other vendors' shapes:
 | `hold_key` | `text`, `duration` |
 | `wait` | `duration` → screenshot |
 | `computer_batch` | `actions: [{action, coordinate, start_coordinate, text, scroll_direction, scroll_amount, duration, repeat, region}]` |
+| `switch_display` | `display`: connector name, `primary` or `all` → screenshot of that monitor; later coordinates refer to it |
 
 Extras that no vendor ships, kept as separate tools so the trained vocabulary stays
 intact. Every mutating action also accepts `settle: true` to append the settled screenshot.
@@ -161,6 +179,7 @@ cua click X Y [--button right] [--count 2]      cua move X Y
 cua drag X1 Y1 X2 Y2                            cua scroll X Y --dy 3
 cua key ctrl+shift+t                            cua type "hello"
 cua cursor | displays | status | wake | doctor
+cua layout [--clear] [--dry-run]                push the compositor's monitor arrangement
 cua record start [--name n] [--fps 15] [--max-side 1920] [--max-seconds 600]
 cua record stop [-o out.mp4] | status
 cua record sheet rec.mp4 -o sheet.png --tiles 6
@@ -218,8 +237,12 @@ keyboard. Design, the two Jetson quirks (5.18 vkms sources on a 5.15 tree, a lib
   Headless works through `vkms` (see Virtual desktop); no VM guests whose scanout is
   host-rendered (virgl), no nested compositors, no remote sessions. A blanked output
   captures black; `cua wake` nudges it.
-- **One CRTC per screenshot.** Multi-monitor is not stitched yet; the input range already
-  spans all displays.
+- **Multi-monitor needs the compositor's layout, and only GNOME is asked.** Without it
+  (`cua layout` not run, another compositor) only the first CRTC is captured and, with
+  two monitors, pointer coordinates are off everywhere, because the compositor spreads
+  the ABS range over the whole desktop; `cua doctor` says so. Rotated outputs are
+  refused. The side monitors are resampled into the primary's pixel density for the
+  full-desktop view; `switch_display` or `zoom` read them at native resolution.
 - **Keyboard layout is US.** ASCII is typed through the virtual keyboard; anything else
   goes through the clipboard, which needs the session's Wayland or X socket to be
   discoverable from `/proc` (it is, from an SSH shell, for the same uid).

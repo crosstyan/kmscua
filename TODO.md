@@ -32,12 +32,19 @@ window listing, the cached tree walk and the focused-node search.
   mutating actions, with the vendor error text. `atspi.rs` already knows the active app.
 - `read_clipboard` / `write_clipboard` via `wl-paste`/`wl-copy` (already used for
   non-ASCII typing).
-- `switch_display` once multi-CRTC capture exists.
 
 ## Capture
 
-- Multi-CRTC: grab every active CRTC and stitch into the union rect. `displays` already
-  lists them; `plan_size` and the ABS range already assume the union.
+- Layout readers beyond Mutter: KDE (`org.kde.KScreen` or `kscreen-doctor -j`), X11
+  (RandR; under Xwayland it reports the layout at a uniform scale, which the daemon
+  already tolerates). `cua layout` only speaks `org.gnome.Mutter.DisplayConfig`.
+- Layout without a compositor to ask (GDM greeter, lock screen on another seat): probe
+  it. Move the pointer to a few ABS points, read which CRTC's cursor plane is visible
+  and where; two points per display fix its affine map. Needs the hardware cursor,
+  moves the pointer briefly. Also a `doctor` check that the pushed layout agrees with
+  the probe.
+- Rotated outputs: the layout planner refuses them; rotate the grabbed frame instead.
+- Hotplug while recording: the re-enumeration waits until the recording stops.
 - Blanked output: detect an all-black frame and nudge (`Wake`) before retrying, instead
   of returning black.
 - `record_frames` extracts each still with its own ffmpeg seek (about 0.3 s each);
@@ -54,8 +61,8 @@ window listing, the cached tree walk and the focused-node search.
   DRM-backend compositor (sway, labwc) in `kmscua-weston.sh`.
 - Separate session bus for the virtual desktop so `get_focused` and the clipboard
   target weston's apps, not the seat0 session.
-- Fold the second daemon into one `cuad` serving several cards (one socket, a
-  `display` selector), which `switch_display` in the Claude Code parity list wants.
+- Fold the second daemon into one `cuad` serving several cards (one socket); the
+  virtual desktop would then be one more display `switch_display` can pick.
 
 ## Input
 
