@@ -294,6 +294,14 @@ pub struct ScreenshotInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub version: String,
+    /// `<git hash>[-dirty]` of the daemon's build; `cua doctor` compares it
+    /// with its own to catch a daemon that was not restarted after an
+    /// install. Empty from daemons older than this field.
+    #[serde(default)]
+    pub build_id: String,
+    /// The long build description, as `cuad --version` prints it.
+    #[serde(default)]
+    pub build: String,
     pub uptime_s: u64,
     pub gpu_driver: Option<String>,
     pub displays: Vec<DisplayInfo>,

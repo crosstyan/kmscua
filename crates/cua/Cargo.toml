@@ -26,3 +26,6 @@ atspi = { version = "0.29", default-features = false, features = ["proxies", "co
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[build-dependencies]
+kmscua-buildinfo = { path = "../buildinfo" }

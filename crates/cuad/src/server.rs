@@ -653,6 +653,8 @@ impl Daemon {
         let info = self.ask(CaptureCmd::Info)?;
         Ok(Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: env!("KMSCUA_BUILD_ID").to_string(),
+            build: env!("KMSCUA_BUILD").to_string(),
             uptime_s: self.started.elapsed().as_secs(),
             gpu_driver: info.gpu_driver,
             displays: serde_json::from_value(displays)?,

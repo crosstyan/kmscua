@@ -35,6 +35,11 @@ cua click 1920 24 && cua key escape
 claude mcp add kmscua -- /usr/local/bin/cua mcp
 ```
 
+`cua --version` and `cuad --version` print the version with the git hash (`-dirty` when
+built from an edited tree), build time, profile and target. `cua doctor` shows its own
+build and the daemon's and warns when they differ: after `install.sh` or a manual
+install the daemon keeps running the old binary until `systemctl restart cuad`.
+
 For oh-my-pi, add to `~/.omp/agent/mcp.json`:
 
 ```json

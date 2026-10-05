@@ -31,4 +31,5 @@ fast_image_resize = { version = "5", features = ["rayon"] }
 jetson = ["dep:cc"]
 
 [build-dependencies]
+kmscua-buildinfo = { path = "../buildinfo" }
 cc = { version = "1", optional = true }

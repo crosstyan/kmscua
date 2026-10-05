@@ -1,7 +1,8 @@
-//! With the `jetson` feature, compile the NvBufSurface / NVENC shim and link
-//! the L4T libraries. Nothing to do otherwise.
+//! Stamp the build (git hash, time, profile) and, with the `jetson` feature,
+//! compile the NvBufSurface / NVENC shim and link the L4T libraries.
 
 fn main() {
+    kmscua_buildinfo::emit();
     #[cfg(feature = "jetson")]
     jetson();
 }

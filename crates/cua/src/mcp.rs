@@ -1184,7 +1184,7 @@ impl CuaServer {
 impl ServerHandler for CuaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("kmscua", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("kmscua", env!("KMSCUA_BUILD")))
             .with_instructions(
                 "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. The screenshot shows every monitor side by side as the desktop is arranged; switch_display narrows it to one monitor and back to all. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
             )

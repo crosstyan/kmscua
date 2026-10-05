@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "cuad", version, about)]
+#[command(name = "cuad", version = env!("KMSCUA_BUILD"), about)]
 struct Args {
     /// Unix socket to listen on.
     #[arg(long, default_value = kmscua_proto::DEFAULT_SOCKET)]
@@ -73,6 +73,7 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    log::info!("cuad {}", env!("KMSCUA_BUILD"));
 
     let mut capture = capture::Capturer::open(args.device.clone(), args.crtc, args.helper.clone())
         .context("open DRM capture")?;

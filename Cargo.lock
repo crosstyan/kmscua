@@ -606,6 +606,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "image",
+ "kmscua-buildinfo",
  "kmscua-proto",
  "log",
  "rmcp",
@@ -627,6 +628,7 @@ dependencies = [
  "evdev",
  "fast_image_resize",
  "image",
+ "kmscua-buildinfo",
  "kmscua-proto",
  "libc",
  "libdrmtap",
@@ -1221,6 +1223,10 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "kmscua-buildinfo"
+version = "0.1.0"
 
 [[package]]
 name = "kmscua-proto"
