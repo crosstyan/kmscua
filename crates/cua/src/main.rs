@@ -650,6 +650,13 @@ pub fn doctor(c: &Client) -> Doctor {
             notes.push(format!(
                 "cuad predates build stamps (cua is {mine}); reinstall and restart it (systemctl restart cuad)"
             ));
+        } else if d.build_id != mine && self_replaced() {
+            // Installing swaps the file under a running `cua mcp`; the stale
+            // side is this process, not the daemon.
+            notes.push(format!(
+                "this cua process is build {mine} but a newer cua has been installed over it (cuad is {}); restart the MCP server (Claude Code: /mcp, reconnect kmscua)",
+                d.build_id
+            ));
         } else if d.build_id != mine {
             notes.push(format!(
                 "cua is build {mine} but cuad is {}: a different build is running; restart it after installing (systemctl restart cuad)",
@@ -701,6 +708,13 @@ pub fn doctor(c: &Client) -> Doctor {
         buttons: None,
         notes,
     }
+}
+
+/// The binary this process runs from has been replaced or removed on disk.
+fn self_replaced() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .map(|p| p.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false)
 }
 
 fn which(bin: &str) -> bool {
