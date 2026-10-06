@@ -35,11 +35,14 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::{atspi, video};
+use crate::{atspi, handedness::{self, Handedness}, video};
 
 /// Default longest side of a screenshot. 1080p is Anthropic's documented
 /// balance of accuracy and cost; the models accept up to 2576 px.
 const DEFAULT_MAX_SIDE: u32 = 1920;
+/// How long a handedness answer is trusted before asking the compositor
+/// again, so flipping the setting mid-session takes effect within seconds.
+const HANDEDNESS_TTL: Duration = Duration::from_secs(5);
 const NOT_EXECUTED: &str = "Not executed: an earlier computer action in this turn failed.";
 
 /// Scale and origin of the last full screenshot: image px -> desktop px.
@@ -82,6 +85,8 @@ pub struct CuaServer {
     rec: Arc<Mutex<Option<RecState>>>,
     last_rec: Arc<Mutex<Option<PathBuf>>>,
     ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
+    /// Left-handed setting of our pointer, with when it was read.
+    hand: Arc<tokio::sync::Mutex<Option<(Instant, Handedness)>>>,
     max_side: u32,
     tool_router: ToolRouter<Self>,
 }
@@ -475,8 +480,23 @@ impl CuaServer {
 
     // ----- primitive actions shared by the flat tools and computer_batch -----
 
+    /// Tools speak of left and right as primary and secondary; this is the
+    /// physical button that means that on this desktop right now.
+    async fn physical(&self, logical: Button) -> Button {
+        let mut hand = self.hand.lock().await;
+        if !matches!(&*hand, Some((at, _)) if at.elapsed() < HANDEDNESS_TTL) {
+            let h = handedness::detect().await;
+            if hand.as_ref().map(|(_, old)| old.swapped) != Some(h.swapped) {
+                log::info!("buttons {}: {}", if h.swapped { "swapped" } else { "normal" }, h.source);
+            }
+            *hand = Some((Instant::now(), h));
+        }
+        hand.as_ref().map(|(_, h)| h.physical(logical)).unwrap_or(logical)
+    }
+
     async fn do_click(&self, coord: [i32; 2], button: Button, count: u32, text: &Option<String>) -> Result<(), ErrorData> {
         let (x, y) = self.to_scanout(coord[0], coord[1]);
+        let button = self.physical(button).await;
         let m = modifiers(text);
         self.blocking(move |c| c.call(&Request::Click { x, y, button, count, modifiers: m }))
             .await
@@ -495,13 +515,14 @@ impl CuaServer {
         };
         let (tx, ty) = self.to_scanout(end[0], end[1]);
         let m = modifiers(text);
+        let button = self.physical(Button::Left).await;
         self.blocking(move |c| {
             c.call(&Request::Drag {
                 from_x: fx,
                 from_y: fy,
                 to_x: tx,
                 to_y: ty,
-                button: Button::Left,
+                button,
                 steps: 16,
                 modifiers: m,
             })
@@ -558,6 +579,7 @@ impl CuaServer {
     }
 
     async fn do_button(&self, button: Button, down: bool) -> Result<(), ErrorData> {
+        let button = self.physical(button).await;
         self.blocking(move |c| c.call(&Request::PointerButton { button, down }))
             .await
             .map(|_| ())
@@ -684,6 +706,7 @@ impl CuaServer {
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
             ui: Arc::new(tokio::sync::Mutex::new(None)),
+            hand: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
             tool_router,
         }
@@ -712,13 +735,13 @@ impl CuaServer {
         Ok(CallToolResult::success(vec![self.do_zoom(p.region).await?]))
     }
 
-    #[tool(name = "left_click", description = "Click the left mouse button at [x, y]. `text` holds modifier keys during the click.")]
+    #[tool(name = "left_click", description = "Click the left (primary) mouse button at [x, y]. `text` holds modifier keys during the click.")]
     async fn left_click(&self, Parameters(p): Parameters<ClickParams>) -> Result<CallToolResult, ErrorData> {
         self.do_click(p.coordinate, Button::Left, 1, &p.text).await?;
         self.done(format!("left_click {:?}", p.coordinate), p.settle.unwrap_or(false)).await
     }
 
-    #[tool(name = "right_click", description = "Click the right mouse button at [x, y].")]
+    #[tool(name = "right_click", description = "Click the right (secondary, context-menu) mouse button at [x, y].")]
     async fn right_click(&self, Parameters(p): Parameters<ClickParams>) -> Result<CallToolResult, ErrorData> {
         self.do_click(p.coordinate, Button::Right, 1, &p.text).await?;
         self.done(format!("right_click {:?}", p.coordinate), p.settle.unwrap_or(false)).await
@@ -1175,7 +1198,11 @@ impl CuaServer {
 
     #[tool(name = "doctor", description = "Report whether capture, input, clipboard paste and recording are available and why not.")]
     async fn doctor(&self) -> Result<CallToolResult, ErrorData> {
-        let d = self.blocking(|c| Ok(crate::doctor(c))).await?;
+        let mut d = self.blocking(|c| Ok(crate::doctor(c))).await?;
+        // Fresh, and into the cache: doctor is where a wrong guess gets noticed.
+        let h = handedness::detect().await;
+        *self.hand.lock().await = Some((Instant::now(), h.clone()));
+        d.buttons = Some(h);
         Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&d).unwrap_or_default())]))
     }
 }
@@ -1186,7 +1213,7 @@ impl ServerHandler for CuaServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("kmscua", env!("KMSCUA_BUILD")))
             .with_instructions(
-                "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. The screenshot shows every monitor side by side as the desktop is arranged; switch_display narrows it to one monitor and back to all. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
+                "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. The screenshot shows every monitor side by side as the desktop is arranged; switch_display narrows it to one monitor and back to all. Actions answer OK and never leave a key or button held (except left_mouse_down). Left means the primary button and right the secondary, even when the desktop is set up left-handed. Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
             )
     }
 }

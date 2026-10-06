@@ -151,6 +151,15 @@ and stops at the first failure. Details and the other vendors' shapes:
 | `computer_batch` | `actions: [{action, coordinate, start_coordinate, text, scroll_direction, scroll_amount, duration, repeat, region}]` |
 | `switch_display` | `display`: connector name, `primary` or `all` → screenshot of that monitor; later coordinates refer to it |
 
+Left means the primary button and right the secondary. The compositor applies a
+left-handed setting to the virtual pointer like to any mouse, so `cua` reads it (KWin's
+per-device `leftHanded`, GNOME's `org.gnome.desktop.peripherals.mouse left-handed`,
+sway's `get_inputs`, Hyprland's `input:left_handed`) and swaps before sending; `doctor`
+shows the answer under `buttons`. Where none of those apply, set
+`KMSCUA_BUTTONS=swapped` (or `normal`) in the MCP server's environment. The CLI's
+`click`/`drag` take `--button primary|secondary` (the default, resolved the same way) or
+`left|right|middle` for a physical button.
+
 Extras that no vendor ships, kept as separate tools so the trained vocabulary stays
 intact. Every mutating action also accepts `settle: true` to append the settled screenshot.
 

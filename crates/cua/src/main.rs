@@ -6,6 +6,7 @@
 //! session environment itself, so it also works from an SSH shell.
 
 mod atspi;
+mod handedness;
 mod layout;
 mod mcp;
 mod session;
@@ -71,8 +72,10 @@ enum Cmd {
     Click {
         x: i32,
         y: i32,
-        #[arg(long, default_value = "left", value_parser = parse_button)]
-        button: Button,
+        /// left|right|middle press that physical button; primary|secondary
+        /// follow the desktop's left-handed setting.
+        #[arg(long, default_value = "primary", value_parser = parse_button)]
+        button: CliButton,
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
@@ -82,8 +85,8 @@ enum Cmd {
         from_y: i32,
         to_x: i32,
         to_y: i32,
-        #[arg(long, default_value = "left", value_parser = parse_button)]
-        button: Button,
+        #[arg(long, default_value = "primary", value_parser = parse_button)]
+        button: CliButton,
     },
     /// Scroll wheel detents at a point (dy > 0 scrolls down).
     Scroll {
@@ -206,12 +209,35 @@ fn cli_crop(path: &Path, region: &Option<String>) -> Result<Option<video::Crop>>
     crop.map(Some).ok_or_else(|| anyhow::anyhow!("region lies outside the video"))
 }
 
-fn parse_button(s: &str) -> Result<Button, String> {
+/// A button as the CLI names it: a physical one, or a role the desktop's
+/// handedness resolves.
+#[derive(Clone, Copy, Debug)]
+enum CliButton {
+    Physical(Button),
+    Primary,
+    Secondary,
+}
+
+impl CliButton {
+    fn resolve(self) -> Result<Button> {
+        let logical = match self {
+            CliButton::Physical(b) => return Ok(b),
+            CliButton::Primary => Button::Left,
+            CliButton::Secondary => Button::Right,
+        };
+        let h = tokio::runtime::Runtime::new()?.block_on(handedness::detect());
+        Ok(h.physical(logical))
+    }
+}
+
+fn parse_button(s: &str) -> Result<CliButton, String> {
     match s.to_ascii_lowercase().as_str() {
-        "left" => Ok(Button::Left),
-        "right" => Ok(Button::Right),
-        "middle" => Ok(Button::Middle),
-        _ => Err(format!("unknown button {s}")),
+        "left" => Ok(CliButton::Physical(Button::Left)),
+        "right" => Ok(CliButton::Physical(Button::Right)),
+        "middle" => Ok(CliButton::Physical(Button::Middle)),
+        "primary" => Ok(CliButton::Primary),
+        "secondary" => Ok(CliButton::Secondary),
+        _ => Err(format!("unknown button {s}: want primary, secondary, left, right or middle")),
     }
 }
 
@@ -246,7 +272,8 @@ fn main() -> Result<()> {
     let c = client(&args);
     match &args.cmd {
         Cmd::Doctor => {
-            let report = doctor(&c);
+            let mut report = doctor(&c);
+            report.buttons = Some(tokio::runtime::Runtime::new()?.block_on(handedness::detect()));
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -307,7 +334,7 @@ fn main() -> Result<()> {
             .call(&Request::Click {
                 x: *x,
                 y: *y,
-                button: *button,
+                button: button.resolve()?,
                 count: *count,
                 modifiers: vec![],
             })
@@ -324,7 +351,7 @@ fn main() -> Result<()> {
                 from_y: *from_y,
                 to_x: *to_x,
                 to_y: *to_y,
-                button: *button,
+                button: button.resolve()?,
                 steps: 12,
                 modifiers: vec![],
             })
@@ -588,6 +615,9 @@ pub struct Doctor {
     pub can_record: bool,
     pub record_codec: Option<String>,
     pub ffmpeg: bool,
+    /// Whether the primary button is the physical right one; filled by the
+    /// callers, which have a runtime to ask the compositor from.
+    pub buttons: Option<handedness::Handedness>,
     pub notes: Vec<String>,
 }
 
@@ -668,6 +698,7 @@ pub fn doctor(c: &Client) -> Doctor {
         ffmpeg,
         clipboard_tool,
         session_env,
+        buttons: None,
         notes,
     }
 }
