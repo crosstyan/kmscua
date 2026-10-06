@@ -5,6 +5,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,31 @@ fn run(cmd: &mut Command) -> Result<Vec<u8>> {
 
 pub fn have_ffmpeg() -> bool {
     Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// The framerate-mode option and its value for `mode` ("vfr" or
+/// "passthrough"). `-fps_mode` arrived in ffmpeg 5.1, which deprecated
+/// `-vsync`, and 9.0 removed `-vsync` outright (927ffd0930), so neither
+/// spelling works everywhere (Ubuntu 22.04 and L4T ship 4.4, rolling distros
+/// ship 9). Ask the installed ffmpeg once
+/// instead of parsing version strings, which distro and git builds mangle.
+fn fps_mode(mode: &str) -> [String; 2] {
+    static HAS_FPS_MODE: OnceLock<bool> = OnceLock::new();
+    let has = *HAS_FPS_MODE.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", "long"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("-fps_mode"))
+            .unwrap_or(true)
+    });
+    if has {
+        ["-fps_mode".into(), mode.into()]
+    } else {
+        // -vsync 0 is passthrough; vfr is spelled the same.
+        ["-vsync".into(), if mode == "passthrough" { "0".into() } else { mode.into() }]
+    }
 }
 
 /// Pixel rectangle in the recording's own pixels.
@@ -116,7 +142,9 @@ pub fn contact_sheet(path: &Path, dur: f32, tiles: u32, tile_w: u32) -> Result<(
     let out = run(Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
         .arg(path)
-        .args(["-vf", &vf, "-vsync", "vfr", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]))?;
+        .args(["-vf", &vf])
+        .args(fps_mode("vfr"))
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]))?;
     if out.is_empty() {
         bail!("ffmpeg produced no sheet");
     }
@@ -177,7 +205,9 @@ pub fn changes(path: &Path, from: f32, to: f32, crop: Option<Crop>, threshold: f
     let raw = run(Command::new("ffmpeg")
         .args(["-v", "error", "-ss", &format!("{from:.3}"), "-i"])
         .arg(path)
-        .args(["-t", &format!("{:.3}", (to - from).max(0.0)), "-vf", &vf, "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "gray", "-"]))?;
+        .args(["-t", &format!("{:.3}", (to - from).max(0.0)), "-vf", &vf])
+        .args(fps_mode("passthrough"))
+        .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"]))?;
     let frame = (w * h) as usize;
     let n = raw.len() / frame.max(1);
     let mut runs: Vec<Run> = Vec::new();
