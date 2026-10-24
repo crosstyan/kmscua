@@ -606,6 +606,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "image",
+ "kmscua-buildinfo",
  "kmscua-proto",
  "log",
  "rmcp",
@@ -621,11 +622,13 @@ name = "cuad"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "env_logger",
  "evdev",
  "fast_image_resize",
  "image",
+ "kmscua-buildinfo",
  "kmscua-proto",
  "libc",
  "libdrmtap",
@@ -1230,6 +1233,10 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "kmscua-buildinfo"
+version = "0.1.0"
 
 [[package]]
 name = "kmscua-proto"
@@ -2477,6 +2484,7 @@ dependencies = [
  "env_logger",
  "fast_image_resize",
  "image",
+ "kmscua-buildinfo",
  "kmscua-proto",
  "libc",
  "log",

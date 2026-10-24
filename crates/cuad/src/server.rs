@@ -11,11 +11,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kmscua_proto::{
-    read_json_frame, write_frame, Header, ImageFormat, RecordInfo, Rect, Request, Status,
+    read_json_frame, write_frame, Header, ImageFormat, LayoutMonitor, RecordInfo, Rect, Request,
+    Status,
 };
 use serde_json::json;
 
@@ -31,6 +33,9 @@ pub struct RecordConfig {
     pub dir: PathBuf,
     /// uid to chown finished recordings to (the socket owner), if any.
     pub owner_uid: Option<u32>,
+    /// Record through the Jetson zero-copy backend (probed at startup);
+    /// the GStreamer codec, if any, is the fallback.
+    pub zero_copy: bool,
 }
 
 enum CaptureCmd {
@@ -44,7 +49,12 @@ enum CaptureCmd {
     },
     Cursor(Sender<Result<serde_json::Value>>),
     Displays(Sender<Result<serde_json::Value>>),
-    Info(Sender<(Option<String>, bool, Option<String>)>),
+    Info(Sender<CaptureInfo>),
+    /// Place the displays; answers the new desktop rect.
+    SetLayout {
+        monitors: Vec<LayoutMonitor>,
+        reply: Sender<Result<Rect>>,
+    },
     RecordStart {
         name: Option<String>,
         fps: u32,
@@ -58,14 +68,40 @@ enum CaptureCmd {
     RecordStatus(Sender<RecordInfo>),
 }
 
+struct CaptureInfo {
+    gpu_driver: Option<String>,
+    cursor_supported: bool,
+    record_codec: Option<String>,
+    layout: Option<String>,
+}
+
+/// Set by the capture thread when a hotplug changed the desktop rect; the
+/// request thread picks it up before its next input request and resizes the
+/// pointer. A slot rather than a message so input never waits on capture.
+type DesktopUpdate = Arc<Mutex<Option<Rect>>>;
+
 struct CaptureWorker {
     capture: Capturer,
     rec: RecordConfig,
     recorder: Option<Recorder>,
     last_info: Option<RecordInfo>,
+    desktop_update: DesktopUpdate,
 }
 
 impl CaptureWorker {
+    /// Re-enumerate after a hotplug. Not while recording: the recorder's
+    /// frame size is fixed, so the change waits until it stops.
+    fn hotplug(&mut self) {
+        if self.recorder.as_ref().map(|r| r.is_running()).unwrap_or(false) {
+            return;
+        }
+        if self.capture.check_hotplug() {
+            if let Ok(d) = self.capture.desktop_rect() {
+                *self.desktop_update.lock().unwrap() = Some(d);
+            }
+        }
+    }
+
     fn run(mut self, rx: mpsc::Receiver<CaptureCmd>) {
         loop {
             let timeout = match &self.recorder {
@@ -99,6 +135,18 @@ impl CaptureWorker {
         }
         let factor = rec.factor();
         let want_cursor = rec.wants_cursor();
+        if rec.zero_copy() {
+            let shot = self
+                .capture
+                .grab_scanout(want_cursor)
+                .map_err(|e| log::debug!("recorder: grab failed, repeating frame: {e:#}"))
+                .ok();
+            if let Err(e) = rec.push_scanout(shot.as_ref()) {
+                log::warn!("recorder: {e:#}; stopping");
+                self.finish_recording();
+            }
+            return;
+        }
         let frame = match self.capture.grab(want_cursor, None) {
             Ok(shot) => {
                 let mut img = recorder::downscale(&shot.rgba, factor);
@@ -147,6 +195,7 @@ impl CaptureWorker {
                 quality,
                 reply,
             } => {
+                self.hotplug();
                 let r = self
                     .capture
                     .screenshot(cursor, region, max_side, format, quality)
@@ -154,17 +203,33 @@ impl CaptureWorker {
                 let _ = reply.send(r);
             }
             CaptureCmd::Cursor(reply) => {
+                self.hotplug();
                 let _ = reply.send(self.capture.cursor().and_then(|c| Ok(serde_json::to_value(c)?)));
             }
             CaptureCmd::Displays(reply) => {
+                self.hotplug();
                 let _ = reply.send(self.capture.displays().and_then(|d| Ok(serde_json::to_value(d)?)));
             }
             CaptureCmd::Info(reply) => {
-                let codec = match *self.rec.codec.lock().unwrap() {
+                let record_codec = match *self.rec.codec.lock().unwrap() {
+                    _ if self.rec.zero_copy => Some(recorder::ZERO_COPY.to_string()),
                     None => Some("detecting".to_string()),
                     Some(c) => c.map(|c| c.name().to_string()),
                 };
-                let _ = reply.send((self.capture.gpu_driver(), self.capture.cursor_supported(), codec));
+                let _ = reply.send(CaptureInfo {
+                    gpu_driver: self.capture.gpu_driver(),
+                    cursor_supported: self.capture.cursor_supported(),
+                    record_codec,
+                    layout: self.capture.layout(),
+                });
+            }
+            CaptureCmd::SetLayout { monitors, reply } => {
+                if self.recorder.as_ref().map(|r| r.is_running()).unwrap_or(false) {
+                    let _ = reply.send(Err(anyhow!("cannot change the layout while recording")));
+                } else {
+                    self.hotplug();
+                    let _ = reply.send(self.capture.set_layout(monitors));
+                }
             }
             CaptureCmd::RecordStart {
                 name,
@@ -191,7 +256,10 @@ impl CaptureWorker {
                     None => self.last_info.clone().unwrap_or(RecordInfo {
                         recording: false,
                         path: None,
-                        codec: self.codec().map(|c| c.name().to_string()),
+                        codec: match self.rec.zero_copy {
+                            true => Some(recorder::ZERO_COPY.to_string()),
+                            false => self.codec().map(|c| c.name().to_string()),
+                        },
                         width: 0,
                         height: 0,
                         fps: 0,
@@ -216,11 +284,6 @@ impl CaptureWorker {
         max_seconds: u32,
         cursor: bool,
     ) -> Result<RecordInfo> {
-        let codec = match *self.rec.codec.lock().unwrap() {
-            None => bail!("encoder detection still running, retry in a few seconds"),
-            Some(None) => bail!("recording disabled: no usable GStreamer H.264 encoder"),
-            Some(Some(c)) => c,
-        };
         if self.recorder.as_ref().map(|r| r.is_running()).unwrap_or(false) {
             bail!("already recording {}", self.recorder.as_ref().unwrap().path().display());
         }
@@ -241,7 +304,16 @@ impl CaptureWorker {
             max_seconds: max_seconds.clamp(1, 6 * 3600),
             cursor,
         };
-        let rec = Recorder::start(codec, opts)?;
+        let rec = match self.rec.zero_copy {
+            true => match Recorder::start_zero_copy(opts.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("recorder: zero-copy start failed ({e:#}), trying GStreamer");
+                    Recorder::start(self.gst_codec()?, opts)?
+                }
+            },
+            false => Recorder::start(self.gst_codec()?, opts)?,
+        };
         let info = rec.info();
         self.recorder = Some(rec);
         self.last_info = None;
@@ -254,6 +326,14 @@ impl CaptureWorker {
 impl CaptureWorker {
     fn codec(&self) -> Option<Codec> {
         self.rec.codec.lock().unwrap().flatten()
+    }
+
+    fn gst_codec(&self) -> Result<Codec> {
+        match *self.rec.codec.lock().unwrap() {
+            None => bail!("encoder detection still running, retry in a few seconds"),
+            Some(None) => bail!("recording disabled: no usable GStreamer H.264 encoder"),
+            Some(Some(c)) => Ok(c),
+        }
     }
 }
 
@@ -287,13 +367,41 @@ fn chown_path(path: &Path, uid: u32) {
 pub struct Daemon {
     capture_tx: Sender<CaptureCmd>,
     pub input: Input,
+    desktop_update: DesktopUpdate,
     record_dir: String,
+    layout_file: PathBuf,
     started: Instant,
     served: u64,
 }
 
+/// The saved layout, None when there is none.
+pub fn load_layout(path: &Path) -> Result<Option<Vec<LayoutMonitor>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).context("decode saved layout")?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("read saved layout"),
+    }
+}
+
+/// Keep the pushed layout for the next start; an empty layout removes it.
+fn save_layout(path: &Path, monitors: &[LayoutMonitor]) -> Result<()> {
+    if monitors.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).context("remove saved layout"),
+        }
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(monitors)?).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
+}
+
 impl Daemon {
-    pub fn new(capture: Capturer, input: Input, rec: RecordConfig) -> Self {
+    pub fn new(capture: Capturer, input: Input, rec: RecordConfig, layout_file: PathBuf) -> Self {
         let record_dir = rec.dir.display().to_string();
         if let Err(e) = fs::create_dir_all(&rec.dir) {
             log::warn!("create {}: {e}", rec.dir.display());
@@ -302,11 +410,13 @@ impl Daemon {
             chown_path(&rec.dir, uid);
         }
         let (tx, rx) = mpsc::channel();
+        let desktop_update: DesktopUpdate = Default::default();
         let worker = CaptureWorker {
             capture,
             rec,
             recorder: None,
             last_info: None,
+            desktop_update: desktop_update.clone(),
         };
         std::thread::Builder::new()
             .name("capture".into())
@@ -315,9 +425,20 @@ impl Daemon {
         Self {
             capture_tx: tx,
             input,
+            desktop_update,
             record_dir,
+            layout_file,
             started: Instant::now(),
             served: 0,
+        }
+    }
+
+    /// Apply a desktop rect the capture thread found after a hotplug.
+    fn sync_pointer(&mut self) -> Result<()> {
+        let pending = self.desktop_update.lock().unwrap().take();
+        match pending {
+            Some(d) => self.input.set_desktop(d),
+            None => Ok(()),
         }
     }
 
@@ -401,8 +522,18 @@ impl Daemon {
     fn dispatch(&mut self, req: Request) -> Result<(serde_json::Value, Vec<u8>)> {
         use Request::*;
         let empty = Vec::new();
+        self.sync_pointer()?;
         Ok(match req {
             Ping => (json!({"pong": true}), empty),
+            SetLayout { monitors } => {
+                let saved = monitors.clone();
+                let desktop = self.ask(|reply| CaptureCmd::SetLayout { monitors, reply })??;
+                self.input.set_desktop(desktop)?;
+                if let Err(e) = save_layout(&self.layout_file, &saved) {
+                    log::warn!("layout applied but not saved: {e:#}");
+                }
+                (serde_json::to_value(self.status()?)?, empty)
+            }
             Status => (serde_json::to_value(self.status()?)?, empty),
             Displays => (self.ask(CaptureCmd::Displays)??, empty),
             Screenshot {
@@ -516,19 +647,25 @@ impl Daemon {
 
     fn status(&mut self) -> Result<Status> {
         let displays = self.ask(CaptureCmd::Displays)??;
-        let (gpu_driver, cursor_supported, record_codec) = self.ask(CaptureCmd::Info)?;
+        // Displays may just have re-enumerated; let the pointer follow first
+        // so `desktop` below is what input will use.
+        self.sync_pointer()?;
+        let info = self.ask(CaptureCmd::Info)?;
         Ok(Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: env!("KMSCUA_BUILD_ID").to_string(),
+            build: env!("KMSCUA_BUILD").to_string(),
             uptime_s: self.started.elapsed().as_secs(),
-            gpu_driver,
+            gpu_driver: info.gpu_driver,
             displays: serde_json::from_value(displays)?,
             desktop: self.input.desktop(),
+            layout: info.layout,
             pointer_device: self.input.names().0,
             keyboard_device: self.input.names().1,
-            cursor_supported,
+            cursor_supported: info.cursor_supported,
             requests_served: self.served,
-            record_dir: record_codec.as_ref().map(|_| self.record_dir.clone()),
-            record_codec,
+            record_dir: info.record_codec.as_ref().map(|_| self.record_dir.clone()),
+            record_codec: info.record_codec,
         })
     }
 }
@@ -566,6 +703,7 @@ fn op_name(req: &Request) -> &'static str {
         RecordStart { .. } => "record_start",
         RecordStop => "record_stop",
         RecordStatus => "record_status",
+        SetLayout { .. } => "set_layout",
     }
 }
 

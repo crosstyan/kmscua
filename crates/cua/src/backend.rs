@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::Result;
 use kmscua_proto::{Client, Reply, Request, Status};
 
+use crate::handedness::Handedness;
+
 /// Answers `kmscua_proto` requests. Called from blocking threads, never from
 /// the async runtime, so an implementation may block.
 ///
@@ -45,11 +47,19 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Report for the `doctor` tool. The default renders `Status`.
-    fn doctor(&self) -> String {
+    /// Which physical button is primary. `None` (the default) asks the
+    /// desktop ([`crate::handedness::detect`]); a backend whose buttons no
+    /// desktop setting remaps answers itself.
+    fn handedness(&self) -> Option<Handedness> {
+        None
+    }
+
+    /// Report for the `doctor` tool, with the button mapping the MCP layer
+    /// just detected. The default renders `Status`.
+    fn doctor(&self, buttons: Option<Handedness>) -> String {
         let v = match self.call(&Request::Status).and_then(|r| r.data::<Status>()) {
-            Ok(s) => serde_json::json!({ "daemon": s }),
-            Err(e) => serde_json::json!({ "daemon": null, "daemon_error": format!("{e:#}") }),
+            Ok(s) => serde_json::json!({ "daemon": s, "buttons": buttons }),
+            Err(e) => serde_json::json!({ "daemon": null, "daemon_error": format!("{e:#}"), "buttons": buttons }),
         };
         serde_json::to_string_pretty(&v).unwrap_or_default()
     }
@@ -64,7 +74,9 @@ impl Backend for Client {
         self.with_timeout(timeout).call(req)
     }
 
-    fn doctor(&self) -> String {
-        serde_json::to_string_pretty(&crate::doctor(self)).unwrap_or_default()
+    fn doctor(&self, buttons: Option<Handedness>) -> String {
+        let mut d = crate::doctor(self);
+        d.buttons = buttons;
+        serde_json::to_string_pretty(&d).unwrap_or_default()
     }
 }

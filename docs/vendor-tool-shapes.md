@@ -69,7 +69,8 @@ Return conventions:
 
 Claude Code adds `request_access`, `list_granted_applications`, `open_application`,
 `switch_display`, `read_clipboard`, `write_clipboard`, and hides non-approved apps from
-the compositor. Not implemented in kmscua.
+the compositor. kmscua implements `switch_display` (connector name, `primary` or
+`all`); the rest is not implemented.
 
 Sources: https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool ,
 https://code.claude.com/docs/en/computer-use , Claude Code `computer-use-mcp` tool source

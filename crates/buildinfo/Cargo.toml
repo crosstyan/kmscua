@@ -1,0 +1,11 @@
+[package]
+name = "kmscua-buildinfo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-script helper: stamps git hash, dirty flag, build time, profile and target into the kmscua binaries"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

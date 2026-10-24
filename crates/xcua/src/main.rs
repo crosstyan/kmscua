@@ -20,7 +20,7 @@ use xcua::xvfb::{self, Owner, State, Up};
 use xcua::{pixels, x11, XBackend};
 
 #[derive(Parser)]
-#[command(name = "xcua", version, about = "kmscua's computer-use tools over X11 (Xvfb), in one unprivileged process")]
+#[command(name = "xcua", version = env!("KMSCUA_BUILD"), about = "kmscua's computer-use tools over X11 (Xvfb), in one unprivileged process")]
 struct Cli {
     /// Where the env file, pidfile and recordings live
     /// [default: $XDG_STATE_HOME/xcua or ~/.local/state/xcua].
@@ -241,6 +241,10 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     (
         "get_focused",
         "Which X window has the keyboard (or is active, when a window manager says so): its id, title, class, pid and geometry, read from window properties. It does not read text inside the window; use zoom for that. Nothing here changes the screen.",
+    ),
+    (
+        "switch_display",
+        "Restrict screenshots to one monitor (by name as doctor lists them under displays, or \"primary\"), or pass \"all\" to see the whole screen again. Returns a screenshot of the selection; coordinates you pass afterwards are pixels of that screenshot. An Xvfb has one screen, so this matters only on an X server with several RandR monitors.",
     ),
     ("doctor", "Report the X display, its extensions, the capture path, keyboard focus and the recording directory, with what to do about anything missing."),
 ];

@@ -15,14 +15,16 @@
 //! also accepts an optional `settle` flag that appends the settled screenshot.
 //!
 //! Coordinates a model passes are pixels of the last full `screenshot`; this
-//! layer converts them to scanout pixels. `zoom` never changes that space.
+//! layer converts them to desktop pixels. `zoom` never changes that space.
+//! `switch_display` narrows the full screenshot to one monitor; the daemon's
+//! `origin` in each reply keeps the conversion right either way.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
-use kmscua_proto::{Button, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo};
+use kmscua_proto::{Button, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo, Status};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
@@ -33,21 +35,28 @@ use serde::Deserialize;
 
 #[cfg(feature = "atspi")]
 use crate::atspi;
-use crate::{video, Backend};
+use crate::{
+    handedness::{self, Handedness},
+    video, Backend,
+};
 
 /// Default longest side of a screenshot. 1080p is Anthropic's documented
 /// balance of accuracy and cost; the models accept up to 2576 px.
 const DEFAULT_MAX_SIDE: u32 = 1920;
+/// How long a handedness answer is trusted before asking the compositor
+/// again, so flipping the setting mid-session takes effect within seconds.
+const HANDEDNESS_TTL: Duration = Duration::from_secs(5);
 const NOT_EXECUTED: &str = "Not executed: an earlier computer action in this turn failed.";
 
-/// Scale and origin of the last full screenshot: image px -> scanout px.
+/// Scale and origin of the last full screenshot: image px -> desktop px.
 #[derive(Clone, Copy)]
 struct View {
     scale: f32,
     ox: i32,
     oy: i32,
-    /// Scanout size the screenshot was taken from (0 before the first shot).
+    /// Desktop size the screenshot was taken from (0 before the first shot).
     src_w: u32,
+    #[allow(dead_code)]
     src_h: u32,
 }
 
@@ -73,10 +82,15 @@ const EXTRA_TOOLS: &[&str] = &[
 pub struct CuaServer {
     backend: Arc<dyn Backend>,
     view: Arc<Mutex<View>>,
+    /// The monitor `switch_display` selected: full screenshots crop to it.
+    /// None = the whole desktop.
+    focus: Arc<Mutex<Option<Rect>>>,
     rec: Arc<Mutex<Option<RecState>>>,
     last_rec: Arc<Mutex<Option<PathBuf>>>,
     #[cfg(feature = "atspi")]
     ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
+    /// Left-handed setting of our pointer, with when it was read.
+    hand: Arc<tokio::sync::Mutex<Option<(Instant, Handedness)>>>,
     max_side: u32,
     /// Server name and instructions sent at `initialize`.
     identity: Arc<(String, String)>,
@@ -84,7 +98,7 @@ pub struct CuaServer {
 }
 
 const DEFAULT_NAME: &str = "kmscua";
-const DEFAULT_INSTRUCTIONS: &str = "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.";
+const DEFAULT_INSTRUCTIONS: &str = "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. The screenshot shows every monitor side by side as the desktop is arranged; switch_display narrows it to one monitor and back to all. Actions answer OK and never leave a key or button held (except left_mouse_down). Left means the primary button and right the secondary, even when the desktop is set up left-handed. Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.";
 
 fn err(e: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(format!("{e:#}"), None)
@@ -178,6 +192,13 @@ pub struct HoldKeyParams {
 pub struct WaitParams {
     /// Seconds to wait, 0-100.
     pub duration: f32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SwitchDisplayParams {
+    /// Connector name as `doctor` lists it ("DP-2", "HDMI-A-1"), "primary",
+    /// or "all" for the whole desktop again.
+    pub display: String,
 }
 
 /// One item of `computer_batch`: the legacy single-tool action schema.
@@ -343,9 +364,11 @@ impl CuaServer {
         Ok((c.x + c.hot_x, c.y + c.hot_y))
     }
 
-    /// Full screenshot. Updates the coordinate view. Image only.
+    /// Full screenshot (of the focused display, if one is selected). Updates
+    /// the coordinate view. Image only.
     async fn shot_full(&self) -> Result<Content, ErrorData> {
         let max_side = self.max_side;
+        let region = *self.focus.lock().unwrap();
         let reply = self
             .blocking(move |c| {
                 c.call(&Request::Screenshot {
@@ -353,7 +376,7 @@ impl CuaServer {
                     format: ImageFormat::Png,
                     quality: None,
                     cursor: Some(true),
-                    region: None,
+                    region,
                 })
             })
             .await?;
@@ -466,8 +489,32 @@ impl CuaServer {
 
     // ----- primitive actions shared by the flat tools and computer_batch -----
 
+    /// The backend's answer when it has one (an X server whose XTEST
+    /// buttons no desktop setting swaps), else the desktop's own setting.
+    async fn detect_hand(&self) -> Handedness {
+        match self.backend.handedness() {
+            Some(h) => h,
+            None => handedness::detect().await,
+        }
+    }
+
+    /// Tools speak of left and right as primary and secondary; this is the
+    /// physical button that means that on this desktop right now.
+    async fn physical(&self, logical: Button) -> Button {
+        let mut hand = self.hand.lock().await;
+        if !matches!(&*hand, Some((at, _)) if at.elapsed() < HANDEDNESS_TTL) {
+            let h = self.detect_hand().await;
+            if hand.as_ref().map(|(_, old)| old.swapped) != Some(h.swapped) {
+                log::info!("buttons {}: {}", if h.swapped { "swapped" } else { "normal" }, h.source);
+            }
+            *hand = Some((Instant::now(), h));
+        }
+        hand.as_ref().map(|(_, h)| h.physical(logical)).unwrap_or(logical)
+    }
+
     async fn do_click(&self, coord: [i32; 2], button: Button, count: u32, text: &Option<String>) -> Result<(), ErrorData> {
         let (x, y) = self.to_scanout(coord[0], coord[1]);
+        let button = self.physical(button).await;
         let m = modifiers(text);
         self.blocking(move |c| c.call(&Request::Click { x, y, button, count, modifiers: m }))
             .await
@@ -486,13 +533,14 @@ impl CuaServer {
         };
         let (tx, ty) = self.to_scanout(end[0], end[1]);
         let m = modifiers(text);
+        let button = self.physical(Button::Left).await;
         self.blocking(move |c| {
             c.call(&Request::Drag {
                 from_x: fx,
                 from_y: fy,
                 to_x: tx,
                 to_y: ty,
-                button: Button::Left,
+                button,
                 steps: 16,
                 modifiers: m,
             })
@@ -548,6 +596,7 @@ impl CuaServer {
     }
 
     async fn do_button(&self, button: Button, down: bool) -> Result<(), ErrorData> {
+        let button = self.physical(button).await;
         self.blocking(move |c| c.call(&Request::PointerButton { button, down }))
             .await
             .map(|_| ())
@@ -694,10 +743,12 @@ impl CuaServer {
         Self {
             backend,
             view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0, src_w: 0, src_h: 0 })),
+            focus: Arc::new(Mutex::new(None)),
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
             #[cfg(feature = "atspi")]
             ui: Arc::new(tokio::sync::Mutex::new(None)),
+            hand: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
             identity: Arc::new((DEFAULT_NAME.to_string(), DEFAULT_INSTRUCTIONS.to_string())),
             tool_router,
@@ -745,13 +796,13 @@ impl CuaServer {
         Ok(CallToolResult::success(vec![self.do_zoom(p.region).await?]))
     }
 
-    #[tool(name = "left_click", description = "Click the left mouse button at [x, y]. `text` holds modifier keys during the click.")]
+    #[tool(name = "left_click", description = "Click the left (primary) mouse button at [x, y]. `text` holds modifier keys during the click.")]
     async fn left_click(&self, Parameters(p): Parameters<ClickParams>) -> Result<CallToolResult, ErrorData> {
         self.do_click(p.coordinate, Button::Left, 1, &p.text).await?;
         self.done(format!("left_click {:?}", p.coordinate), p.settle.unwrap_or(false)).await
     }
 
-    #[tool(name = "right_click", description = "Click the right mouse button at [x, y].")]
+    #[tool(name = "right_click", description = "Click the right (secondary, context-menu) mouse button at [x, y].")]
     async fn right_click(&self, Parameters(p): Parameters<ClickParams>) -> Result<CallToolResult, ErrorData> {
         self.do_click(p.coordinate, Button::Right, 1, &p.text).await?;
         self.done(format!("right_click {:?}", p.coordinate), p.settle.unwrap_or(false)).await
@@ -852,6 +903,38 @@ impl CuaServer {
         let secs = p.duration.clamp(0.0, 100.0);
         tokio::time::sleep(Duration::from_secs_f32(secs)).await;
         self.mark(format!("wait {secs}s"));
+        Ok(CallToolResult::success(vec![self.shot_full().await?]))
+    }
+
+    #[tool(
+        name = "switch_display",
+        description = "Restrict screenshots to one monitor (by connector name as doctor lists them, or \"primary\"), or pass \"all\" to see the whole desktop again. Returns a screenshot of the selection; coordinates you pass afterwards are pixels of that screenshot. Use it when a window lives on a side monitor that is small in the full-desktop view."
+    )]
+    async fn switch_display(&self, Parameters(p): Parameters<SwitchDisplayParams>) -> Result<CallToolResult, ErrorData> {
+        let want = p.display.trim();
+        let status: Status = self.blocking(|c| c.call(&Request::Status)?.data()).await?;
+        let placed: Vec<_> = status.displays.iter().filter(|d| d.desktop.is_some()).collect();
+        let chosen = if want.eq_ignore_ascii_case("all") {
+            None
+        } else if want.eq_ignore_ascii_case("primary") {
+            Some(placed.iter().find(|d| (d.scale - 1.0).abs() < 1e-3).or(placed.first()).ok_or_else(|| bad("no display is placed"))?.desktop)
+        } else {
+            let key = want.to_ascii_uppercase().replace("HDMI-A-", "HDMI-");
+            Some(
+                placed
+                    .iter()
+                    .find(|d| d.name.to_ascii_uppercase().replace("HDMI-A-", "HDMI-") == key)
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "no placed display named {want}; available: {}, primary, all",
+                            placed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ))
+                    })?
+                    .desktop,
+            )
+        };
+        *self.focus.lock().unwrap() = chosen.flatten();
+        self.mark(format!("switch_display {want}"));
         Ok(CallToolResult::success(vec![self.shot_full().await?]))
     }
 
@@ -1022,19 +1105,16 @@ impl CuaServer {
             Some(s) => (s.started_wall, s.timeline.clone()),
             None => (SystemTime::now() - Duration::from_secs_f32(info.seconds.max(0.0)), Vec::new()),
         };
-        let source = {
-            let v = *self.view.lock().unwrap();
-            if v.src_w > 0 {
-                (v.src_w, v.src_h)
-            } else {
-                self.blocking(|c| c.call(&Request::Status))
-                    .await
-                    .ok()
-                    .and_then(|r| r.data::<kmscua_proto::Status>().ok())
-                    .map(|s| (s.desktop.width, s.desktop.height))
-                    .unwrap_or((0, 0))
-            }
-        };
+        // The recording covers the whole desktop even when screenshots are
+        // focused on one display, so the manifest's source size comes from
+        // the daemon, not the view.
+        let source = self
+            .blocking(|c| c.call(&Request::Status))
+            .await
+            .ok()
+            .and_then(|r| r.data::<Status>().ok())
+            .map(|s| (s.desktop.width, s.desktop.height))
+            .unwrap_or((0, 0));
         let manifest = video::manifest_from(&info, started_wall, source, &timeline);
         let _ = video::write_manifest(&path, &manifest);
         lines[0].push_str(&format!(" | started {} | manifest {}", manifest.started_at, video::manifest_path(&path).display()));
@@ -1172,7 +1252,10 @@ impl CuaServer {
 
     #[tool(name = "doctor", description = "Report whether capture, input, clipboard paste and recording are available and why not.")]
     async fn doctor(&self) -> Result<CallToolResult, ErrorData> {
-        let d = self.blocking(|c| Ok(c.doctor())).await?;
+        // Fresh, and into the cache: doctor is where a wrong guess gets noticed.
+        let h = self.detect_hand().await;
+        *self.hand.lock().await = Some((Instant::now(), h.clone()));
+        let d = self.blocking(move |c| Ok(c.doctor(Some(h)))).await?;
         Ok(CallToolResult::success(vec![Content::text(d)]))
     }
 }
@@ -1181,7 +1264,7 @@ impl CuaServer {
 impl ServerHandler for CuaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(self.identity.0.clone(), env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(self.identity.0.clone(), env!("KMSCUA_BUILD")))
             .with_instructions(self.identity.1.clone())
     }
 }

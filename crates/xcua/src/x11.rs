@@ -600,7 +600,15 @@ impl Capture {
         })
     }
 
-    /// RandR 1.5 monitors, else the one screen.
+    /// Whether the layout comes from RandR monitors (else one screen).
+    pub fn layout_source(&self) -> Option<String> {
+        let d = self.displays().ok()?;
+        (d.len() > 1 || d.first().is_some_and(|m| m.name != "screen")).then(|| "randr".to_string())
+    }
+
+    /// RandR 1.5 monitors, else the one screen. Each is placed in desktop
+    /// space at its root-window position with scale 1.0, which is what
+    /// `switch_display` crops to.
     pub fn displays(&self) -> Result<Vec<DisplayInfo>> {
         let (w, h) = self.size()?;
         let screen = || DisplayInfo {
@@ -613,6 +621,9 @@ impl Capture {
             height: h,
             refresh_hz: 0,
             active: true,
+            // One screen: desktop pixels are its pixels.
+            desktop: Some(Rect { x: 0, y: 0, width: w, height: h }),
+            scale: 1.0,
         };
         if self.conn.extension_information("RANDR")?.is_none() {
             return Ok(vec![screen()]);
@@ -639,6 +650,10 @@ impl Capture {
                 height: mon.height as u32,
                 refresh_hz: 0,
                 active: true,
+                // The root window is the desktop; RandR monitors are already
+                // placed in it, 1:1.
+                desktop: Some(Rect { x: mon.x as i32, y: mon.y as i32, width: mon.width as u32, height: mon.height as u32 }),
+                scale: 1.0,
             })
             .collect();
         Ok(if list.is_empty() { vec![screen()] } else { list })

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use kmscua_mcp::handedness::Handedness;
 use kmscua_mcp::Backend;
 use kmscua_proto::{Header, RecordInfo, Reply, Request, Status};
 use serde_json::json;
@@ -222,10 +223,13 @@ impl XBackend {
         let cap = lock(&self.capture);
         Ok(Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: env!("KMSCUA_BUILD_ID").to_string(),
+            build: env!("KMSCUA_BUILD").to_string(),
             uptime_s: self.started.elapsed().as_secs(),
             gpu_driver: None,
             displays: cap.displays()?,
             desktop: cap.desktop()?,
+            layout: cap.layout_source(),
             pointer_device: "xtest".into(),
             keyboard_device: "xtest".into(),
             cursor_supported: cap.cursor_supported(),
@@ -357,6 +361,9 @@ impl XBackend {
                 (serde_json::to_value(self.record_start(opts)?)?, empty)
             }
             RecordStop => (serde_json::to_value(self.record_stop()?)?, empty),
+            SetLayout { .. } => bail!(
+                "SetLayout is not supported on X11: the X server owns the monitor layout (RandR) and xcua reads it from there; one Xvfb is one display"
+            ),
             RecordStatus => (serde_json::to_value(self.record_status())?, empty),
         })
     }
@@ -382,6 +389,14 @@ impl XBackend {
         if spare == 0 {
             notes.push("no free keycode: characters outside the keyboard layout cannot be typed");
         }
+        let displays: Vec<String> = lock(&self.capture)
+            .displays()
+            .map(|d| {
+                d.iter()
+                    .map(|m| format!("{} {}x{}+{}+{}", m.name, m.width, m.height, m.x, m.y))
+                    .collect()
+            })
+            .unwrap_or_default();
         let (size, shm) = {
             let mut c = lock(&self.capture);
             // A grab tells whether SHM, when asked for, really works.
@@ -391,6 +406,8 @@ impl XBackend {
         json!({
             "display": self.display(),
             "size": size.map(|(w, h)| format!("{w}x{h}")),
+            "displays": displays,
+            "build": env!("KMSCUA_BUILD"),
             "extensions": extensions,
             "capture": if shm { "MIT-SHM" } else { "GetImage" },
             "window_manager": wm,
@@ -419,7 +436,7 @@ impl Kind {
     fn of(req: &Request) -> Self {
         use Request::*;
         match req {
-            Ping | Status | Displays | Screenshot { .. } | Cursor => Kind::Read,
+            Ping | Status | Displays | Screenshot { .. } | Cursor | SetLayout { .. } => Kind::Read,
             RecordStart { .. } | RecordStop | RecordStatus => Kind::Record,
             PointerMove { .. }
             | PointerButton { .. }
@@ -486,7 +503,11 @@ impl Backend for XBackend {
         Some(x11::focused_text(i.conn(), i.root()))
     }
 
-    fn doctor(&self) -> String {
+    fn handedness(&self) -> Option<Handedness> {
+        Some(Handedness::normal("X server: XTEST buttons are not swapped by any desktop left-handed setting"))
+    }
+
+    fn doctor(&self, _buttons: Option<Handedness>) -> String {
         serde_json::to_string_pretty(&self.doctor_report()).unwrap_or_default()
     }
 }

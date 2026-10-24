@@ -8,6 +8,9 @@
 #[cfg(feature = "atspi")]
 pub mod atspi;
 pub mod backend;
+pub mod handedness;
+#[cfg(feature = "dbus")]
+pub mod layout;
 pub mod mcp;
 pub mod session;
 pub mod stills;
@@ -106,6 +109,9 @@ fn paste(c: &dyn Backend, text: &str) -> Result<()> {
 
 #[derive(serde::Serialize)]
 pub struct Doctor {
+    /// This `cua` binary's build, as `cua --version` prints it. The
+    /// daemon's own is under `daemon.build`.
+    pub client_build: String,
     pub socket: String,
     pub daemon: Option<Status>,
     pub daemon_error: Option<String>,
@@ -117,6 +123,9 @@ pub struct Doctor {
     pub can_record: bool,
     pub record_codec: Option<String>,
     pub ffmpeg: bool,
+    /// Whether the primary button is the physical right one; filled by the
+    /// callers, which have a runtime to ask the compositor from.
+    pub buttons: Option<handedness::Handedness>,
     pub notes: Vec<String>,
 }
 
@@ -143,6 +152,26 @@ pub fn doctor(c: &Client) -> Doctor {
     if clipboard_tool.is_none() {
         notes.push("no clipboard tool: non-ASCII typing will fail (apt install wl-clipboard)".into());
     }
+    if let Some(d) = &daemon {
+        let mine = env!("KMSCUA_BUILD_ID");
+        if d.build_id.is_empty() {
+            notes.push(format!(
+                "cuad predates build stamps (cua is {mine}); reinstall and restart it (systemctl restart cuad)"
+            ));
+        } else if d.build_id != mine && self_replaced() {
+            // Installing swaps the file under a running `cua mcp`; the stale
+            // side is this process, not the daemon.
+            notes.push(format!(
+                "this cua process is build {mine} but a newer cua has been installed over it (cuad is {}); restart the MCP server (Claude Code: /mcp, reconnect kmscua)",
+                d.build_id
+            ));
+        } else if d.build_id != mine {
+            notes.push(format!(
+                "cua is build {mine} but cuad is {}: a different build is running; restart it after installing (systemctl restart cuad)",
+                d.build_id
+            ));
+        }
+    }
     let can = daemon.is_some();
     let ffmpeg = video::have_ffmpeg();
     let record_codec = daemon.as_ref().and_then(|d| d.record_codec.clone());
@@ -162,8 +191,16 @@ pub fn doctor(c: &Client) -> Doctor {
         if d.displays.iter().all(|d| !d.active) {
             notes.push("no active display: outputs are blanked, try `cua wake`".into());
         }
+        let active = d.displays.iter().filter(|d| d.active).count();
+        if active > 1 && d.layout.is_none() {
+            let shown = d.displays.iter().find(|d| d.desktop.is_some()).map(|d| d.name.as_str()).unwrap_or("?");
+            notes.push(format!(
+                "{active} active displays but no layout: only {shown} is captured and pointer coordinates are off on every monitor; run `cua layout` (GNOME) to fix both"
+            ));
+        }
     }
     Doctor {
+        client_build: env!("KMSCUA_BUILD").to_string(),
         socket: c.socket_path().display().to_string(),
         daemon,
         daemon_error,
@@ -176,8 +213,16 @@ pub fn doctor(c: &Client) -> Doctor {
         ffmpeg,
         clipboard_tool,
         session_env,
+        buttons: None,
         notes,
     }
+}
+
+/// The binary this process runs from has been replaced or removed on disk.
+fn self_replaced() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .map(|p| p.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false)
 }
 
 fn which(bin: &str) -> bool {

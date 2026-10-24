@@ -1,11 +1,15 @@
 //! cuad: the privileged half of kmscua.
 //!
 //! Runs as root (or with CAP_SYS_ADMIN for the DRM side and rw /dev/uinput).
-//! Owns one libdrmtap context and two uinput devices for its whole lifetime,
-//! and answers requests on a unix socket. It never talks to a compositor.
+//! Owns one libdrmtap context per active CRTC and two uinput devices for its
+//! whole lifetime, and answers requests on a unix socket. It never talks to
+//! a compositor: the one thing only the compositor knows, how the monitors
+//! are arranged, the client reads there and pushes here (`cua layout`).
 
 mod capture;
 mod input;
+#[cfg(feature = "jetson")]
+mod jetson;
 mod keymap;
 mod recorder;
 mod server;
@@ -16,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "cuad", version, about)]
+#[command(name = "cuad", version = env!("KMSCUA_BUILD"), about)]
 struct Args {
     /// Unix socket to listen on.
     #[arg(long, default_value = kmscua_proto::DEFAULT_SOCKET)]
@@ -34,7 +38,8 @@ struct Args {
     /// DRM device (default: auto-detect the card with an active CRTC).
     #[arg(long)]
     device: Option<String>,
-    /// CRTC id to capture (default: first active).
+    /// Capture only this CRTC (default: every active one, arranged by the
+    /// layout `cua layout` pushes; until then only the first is captured).
     #[arg(long, default_value_t = 0)]
     crtc: u32,
     /// libdrmtap privilege helper, for running without CAP_SYS_ADMIN.
@@ -49,12 +54,17 @@ struct Args {
     /// encoder is present).
     #[arg(long)]
     no_record: bool,
-    /// Force an encoder: nvv4l2h264enc (Jetson), nvh264enc (NVENC), x264enc, openh264enc.
+    /// Force an encoder: jetson-zc (Jetson zero-copy, needs the `jetson` build
+    /// feature), nvv4l2h264enc (Jetson), nvh264enc (NVENC), x264enc, openh264enc.
     #[arg(long, env = "KMSCUA_RECORD_CODEC")]
     record_codec: Option<String>,
     /// Where recordings are written.
     #[arg(long, default_value = "/var/lib/kmscua/recordings", env = "KMSCUA_RECORD_DIR")]
     record_dir: PathBuf,
+    /// Where the last pushed monitor layout is kept, so it survives a
+    /// daemon restart. It is re-checked against the connected displays.
+    #[arg(long, default_value = "/var/lib/kmscua/layout.json", env = "KMSCUA_LAYOUT_FILE")]
+    layout_file: PathBuf,
     /// Probe capture and input, print status JSON, exit.
     #[arg(long)]
     check: bool,
@@ -63,9 +73,21 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    log::info!("cuad {}", env!("KMSCUA_BUILD"));
 
     let mut capture = capture::Capturer::open(args.device.clone(), args.crtc, args.helper.clone())
         .context("open DRM capture")?;
+    match server::load_layout(&args.layout_file) {
+        Ok(Some(monitors)) => match capture.set_layout(monitors) {
+            Ok(_) => log::info!("layout restored from {}", args.layout_file.display()),
+            Err(e) => log::warn!(
+                "saved layout {} does not fit the connected displays ({e:#}); single-display default until `cua layout` runs",
+                args.layout_file.display()
+            ),
+        },
+        Ok(None) => {}
+        Err(e) => log::warn!("ignoring {}: {e:#}", args.layout_file.display()),
+    }
     let desktop = capture.desktop_rect().context("determine desktop rect")?;
     log::info!(
         "desktop {}x{} at ({},{}), gpu driver {:?}, cursor {}",
@@ -82,7 +104,14 @@ fn main() -> Result<()> {
     // the startup path; recording requests before it finishes are refused
     // with "detecting".
     let codec_slot: server::CodecSlot = Default::default();
-    if !args.no_record {
+    let zero_copy = !args.no_record && recorder::zero_copy_probe(&mut capture, args.record_codec.as_deref());
+    if zero_copy {
+        log::info!("recording: {} (VIC + NVENC from the scanout dma-buf) -> {}", recorder::ZERO_COPY, args.record_dir.display());
+    }
+    if args.record_codec.as_deref() == Some(recorder::ZERO_COPY) {
+        // Forced: no GStreamer fallback, and no gst-inspect run.
+        *codec_slot.lock().unwrap() = Some(None);
+    } else if !args.no_record {
         let slot = codec_slot.clone();
         let preferred = args.record_codec.clone();
         let dir = args.record_dir.clone();
@@ -114,8 +143,9 @@ fn main() -> Result<()> {
         codec: codec_slot,
         dir: args.record_dir.clone(),
         owner_uid,
+        zero_copy,
     };
-    let mut daemon = server::Daemon::new(capture, input, rec);
+    let mut daemon = server::Daemon::new(capture, input, rec, args.layout_file.clone());
 
     if args.check {
         let (info, bytes) = daemon.screenshot(Some(1280))?;

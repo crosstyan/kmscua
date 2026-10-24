@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use kmscua_mcp::{doctor, type_text, video, ServeOptions};
+#[cfg(feature = "dbus")]
+use kmscua_mcp::layout;
+use kmscua_mcp::{doctor, handedness, type_text, video, ServeOptions};
 use kmscua_proto::{Button, Client, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo};
 
 #[derive(Parser, Debug)]
-#[command(name = "cua", version, about)]
+#[command(name = "cua", version = env!("KMSCUA_BUILD"), about)]
 struct Args {
     /// cuad socket (or KMSCUA_SOCKET).
     #[arg(long, global = true)]
@@ -31,6 +33,17 @@ enum Cmd {
     Status,
     /// Connected displays.
     Displays,
+    /// Read the monitor arrangement from the compositor (GNOME) and push it
+    /// to cuad, so screenshots and input cover every monitor. The MCP
+    /// server does this at start; run it by hand after rearranging monitors.
+    Layout {
+        /// Forget the layout: back to capturing the first display only.
+        #[arg(long)]
+        clear: bool,
+        /// Print the layout as read from the compositor without pushing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Save a screenshot.
     Screenshot {
         #[arg(short, long, default_value = "screenshot.png")]
@@ -54,8 +67,10 @@ enum Cmd {
     Click {
         x: i32,
         y: i32,
-        #[arg(long, default_value = "left", value_parser = parse_button)]
-        button: Button,
+        /// left|right|middle press that physical button; primary|secondary
+        /// follow the desktop's left-handed setting.
+        #[arg(long, default_value = "primary", value_parser = parse_button)]
+        button: CliButton,
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
@@ -65,8 +80,8 @@ enum Cmd {
         from_y: i32,
         to_x: i32,
         to_y: i32,
-        #[arg(long, default_value = "left", value_parser = parse_button)]
-        button: Button,
+        #[arg(long, default_value = "primary", value_parser = parse_button)]
+        button: CliButton,
     },
     /// Scroll wheel detents at a point (dy > 0 scrolls down).
     Scroll {
@@ -189,12 +204,35 @@ fn cli_crop(path: &Path, region: &Option<String>) -> Result<Option<video::Crop>>
     crop.map(Some).ok_or_else(|| anyhow::anyhow!("region lies outside the video"))
 }
 
-fn parse_button(s: &str) -> Result<Button, String> {
+/// A button as the CLI names it: a physical one, or a role the desktop's
+/// handedness resolves.
+#[derive(Clone, Copy, Debug)]
+enum CliButton {
+    Physical(Button),
+    Primary,
+    Secondary,
+}
+
+impl CliButton {
+    fn resolve(self) -> Result<Button> {
+        let logical = match self {
+            CliButton::Physical(b) => return Ok(b),
+            CliButton::Primary => Button::Left,
+            CliButton::Secondary => Button::Right,
+        };
+        let h = tokio::runtime::Runtime::new()?.block_on(handedness::detect());
+        Ok(h.physical(logical))
+    }
+}
+
+fn parse_button(s: &str) -> Result<CliButton, String> {
     match s.to_ascii_lowercase().as_str() {
-        "left" => Ok(Button::Left),
-        "right" => Ok(Button::Right),
-        "middle" => Ok(Button::Middle),
-        _ => Err(format!("unknown button {s}")),
+        "left" => Ok(CliButton::Physical(Button::Left)),
+        "right" => Ok(CliButton::Physical(Button::Right)),
+        "middle" => Ok(CliButton::Physical(Button::Middle)),
+        "primary" => Ok(CliButton::Primary),
+        "secondary" => Ok(CliButton::Secondary),
+        _ => Err(format!("unknown button {s}: want primary, secondary, left, right or middle")),
     }
 }
 
@@ -229,12 +267,30 @@ fn main() -> Result<()> {
     let c = client(&args);
     match &args.cmd {
         Cmd::Doctor => {
-            let report = doctor(&c);
+            let mut report = doctor(&c);
+            report.buttons = Some(tokio::runtime::Runtime::new()?.block_on(handedness::detect()));
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Cmd::Status => print_json(&c.call(&Request::Status)?.header.data),
         Cmd::Displays => print_json(&c.call(&Request::Displays)?.header.data),
+        #[cfg(not(feature = "dbus"))]
+        Cmd::Layout { .. } => bail!("layout is unavailable: cua was built without the dbus feature"),
+        #[cfg(feature = "dbus")]
+        Cmd::Layout { clear, dry_run } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            if *dry_run {
+                let monitors = rt.block_on(layout::query_mutter())?;
+                return print_json(&serde_json::to_value(monitors)?);
+            }
+            let status = if *clear {
+                rt.block_on(layout::set(&c, Vec::new()))?
+            } else {
+                rt.block_on(layout::push(&c))?
+            };
+            println!("{}", layout::describe(&status));
+            Ok(())
+        }
         Cmd::Screenshot {
             out,
             max_side,
@@ -276,7 +332,7 @@ fn main() -> Result<()> {
             .call(&Request::Click {
                 x: *x,
                 y: *y,
-                button: *button,
+                button: button.resolve()?,
                 count: *count,
                 modifiers: vec![],
             })
@@ -293,7 +349,7 @@ fn main() -> Result<()> {
                 from_y: *from_y,
                 to_x: *to_x,
                 to_y: *to_y,
-                button: *button,
+                button: button.resolve()?,
                 steps: 12,
                 modifiers: vec![],
             })
@@ -331,7 +387,20 @@ fn main() -> Result<()> {
                 other => bail!("--tools must be all or core, not {other}"),
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(kmscua_mcp::serve_stdio(Arc::new(c), ServeOptions { max_side: *max_side, core_only: core, ..Default::default() }))
+            rt.block_on(async {
+                // The daemon cannot see how the monitors are arranged; tell it
+                // before the model's first screenshot. Best effort: with one
+                // monitor, or on a compositor we cannot ask yet, the
+                // single-display default still works.
+                #[cfg(feature = "dbus")]
+                match layout::push(&c).await {
+                    Ok(s) => log::info!("layout pushed:\n{}", layout::describe(&s)),
+                    Err(e) => log::warn!("layout not pushed ({e:#}); capturing the first display only"),
+                }
+                #[cfg(not(feature = "dbus"))]
+                log::warn!("layout not pushed (built without the dbus feature); capturing the first display only");
+                kmscua_mcp::serve_stdio(Arc::new(c), ServeOptions { max_side: *max_side, core_only: core, ..Default::default() }).await
+            })
         }
     }
 }

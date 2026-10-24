@@ -127,6 +127,12 @@ fn screenshot_dims_and_status() {
     assert!(s.gpu_driver.is_none());
     assert_eq!(s.record_codec.as_deref(), Some("jpeg-stills"));
     assert!(!s.displays.is_empty());
+    // Upstream's multi-display fields: one Xvfb is one display, placed 1:1.
+    assert_eq!(s.displays[0].desktop, Some(Rect { x: 0, y: 0, width: 640, height: 480 }));
+    assert_eq!(s.displays[0].scale, 1.0);
+    assert!(!s.build_id.is_empty() && s.build.contains(&s.build_id), "{} / {}", s.build_id, s.build);
+    let e = b.call(&Request::SetLayout { monitors: vec![] }).unwrap_err();
+    assert!(format!("{e:#}").contains("not supported on X11"), "{e:#}");
     b.call(&Request::Ping).unwrap();
     b.call(&Request::Wake).unwrap();
     // Recording is the recorder's job; whatever it answers must be Err or a
@@ -469,6 +475,11 @@ fn mcp_with_display_set_starts_its_own() {
     assert_eq!(m.tool("screenshot", serde_json::json!({})), "<image>");
     let doctor = m.tool("doctor", serde_json::json!({}));
     assert!(doctor.contains("320x240") && doctor.contains(&format!("\"{own}\"")), "{doctor}");
+    // Upstream's switch_display works on the X screen as one placed display.
+    assert_eq!(m.tool("switch_display", serde_json::json!({"display": "primary"})), "<image>");
+    assert_eq!(m.tool("switch_display", serde_json::json!({"display": "all"})), "<image>");
+    let none = m.tool("switch_display", serde_json::json!({"display": "HDMI-9"}));
+    assert!(none.starts_with("ERR") && none.contains("available"), "{none}");
     let pid = cli.pid().unwrap();
     m.finish();
     assert!(wait_until(Duration::from_secs(15), || !alive(pid)), "mcp's Xvfb outlived it");
@@ -755,7 +766,7 @@ fn attached_display_is_not_marked() {
     let b = backend(&x, false);
     b.call(&Request::Screenshot { max_side: Some(64), format: ImageFormat::Png, quality: None, cursor: None, region: None }).unwrap();
     b.call(&Request::PointerMove { x: 5, y: 5 }).unwrap();
-    let _ = b.doctor();
+    let _ = b.doctor(None);
     let (conn, screen) = RustConnection::connect(Some(&x.display)).unwrap();
     let root = conn.setup().roots[screen].root;
     assert_eq!(xcua::x11::read_nonce(&conn, root), None, "wrote _XCUA_NONCE on an attached display");

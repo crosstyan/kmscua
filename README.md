@@ -28,12 +28,17 @@ Why this route and not the others: [docs/prior-art.md](docs/prior-art.md).
 ## Install
 
 ```
-packaging/install.sh                # builds, installs, creates group kmscua, enables cuad.service
+packaging/install.sh                # builds (on Jetson with cuad/jetson), installs, creates group kmscua, enables cuad.service
 cua doctor                          # everything should say true
 cua screenshot -o shot.png --max-side 1280
 cua click 1920 24 && cua key escape
 claude mcp add kmscua -- /usr/local/bin/cua mcp
 ```
+
+`cua --version` and `cuad --version` print the version with the git hash (`-dirty` when
+built from an edited tree), build time, profile and target. `cua doctor` shows its own
+build and the daemon's and warns when they differ: after `install.sh` or a manual
+install the daemon keeps running the old binary until `systemctl restart cuad`.
 
 For oh-my-pi, add to `~/.omp/agent/mcp.json`:
 
@@ -45,7 +50,11 @@ Requirements: a DRM card with an active CRTC, kernel `uinput` (L4T ships without
 DKMS-style build is in the TODO), root for `cuad`, `wl-clipboard` or `xclip` in the
 session for non-ASCII typing, `ffmpeg` for contact sheets and frame extraction, and for
 recording a GStreamer H.264 encoder (`nvv4l2h264enc` on Jetson, `nvh264enc`, `x264enc` or
-`openh264enc` elsewhere).
+`openh264enc` elsewhere). On Jetson, `cargo build --release --features cuad/jetson` adds a
+zero-copy recorder that needs no GStreamer: the scanout dma-buf goes through the VIC and NVENC
+(`src/jetson/`), about 10% of one core at 30 fps against well over a full core for the RGBA
+path. It is used when the scanout imports, else recording falls back to GStreamer;
+`--record-codec jetson-zc` forces it.
 
 ## Layout
 
@@ -56,6 +65,7 @@ crates/cuad    root daemon
                input.rs     uinput absolute pointer + keyboard; every request atomic
                keymap.rs    US layout and xdotool key names
                recorder.rs  fixed-rate frame loop into a gst-launch child, MP4 out
+               jetson/      (feature `jetson`) scanout -> VIC -> NVENC shim, minimal MP4 muxer
                server.rs    unix socket loop + capture worker thread
 crates/xcua    the same tools over X11 in one unprivileged process (Xvfb, XTEST, no cuad)
 crates/cua     client; also the library kmscua_mcp (feature `atspi`, default on)
@@ -66,6 +76,8 @@ crates/cua     client; also the library kmscua_mcp (feature `atspi`, default on)
                video.rs     ffmpeg contact sheets, frames, scene changes, timeline sidecar
                stills.rs    recordings as a directory of JPEG stills (layout contract)
                session.rs   finds the user's Wayland/X/D-Bus env from /proc
+               layout.rs    reads the monitor arrangement from Mutter, pushes it to cuad
+               handedness.rs which physical button is primary (GNOME, KDE, sway, Hyprland)
 third_party/libdrmtap   vendored MIT library with the Tegra cursor EGL fallback patch
 packaging/     systemd unit + install script
 docs/          prior art, vendor tool shapes
@@ -97,6 +109,22 @@ One frame per tick, the previous frame repeated if a grab is late, so video time
 wall time. Closing the pipe sends EOS and the MP4 trailer is written. GStreamer runs out
 of process; nothing from it or from the NVIDIA stack is linked into the root daemon.
 
+**Several monitors.** DRM knows each CRTC's mode and nothing about where the monitors
+sit next to each other or at what scale; compositors give every CRTC its own
+framebuffer, so all of them report offset (0,0). The arrangement lives in the compositor,
+and that is the one thing `cua` asks it for: `cua layout` reads Mutter's `DisplayConfig`
+over D-Bus and pushes the logical rectangles to `cuad` (the MCP server does this at
+start). From them the daemon builds one *desktop space*: the primary monitor 1:1 with its
+scanout, every other monitor resampled by the ratio of the two pixel densities, placed
+where the compositor puts it. A screenshot grabs every CRTC the region touches and
+stitches them; the pointer's ABS range is the desktop rect. That works because
+compositors map an absolute device linearly across the whole logical desktop, so
+`ABS(x, y)` lands on desktop pixel `(x, y)` on every monitor at once. Only the layout's
+proportions matter, which is why the same numbers would work from xrandr too. With one
+monitor, or before a layout arrives, desktop space is the first scanout and nothing
+changes. `switch_display` crops screenshots to one monitor when a window on a small side
+monitor needs more pixels. GNOME only so far; rotated outputs are refused with a message.
+
 **Privilege.** `cuad` needs `CAP_SYS_ADMIN` for `drmModeGetFB2` and rw `/dev/uinput`. It
 listens on `/run/kmscua/cuad.sock`, mode 0660, group `kmscua`, chowned to the installing
 user via a systemd drop-in so no re-login is needed. Recordings land in
@@ -126,6 +154,16 @@ and stops at the first failure. Details and the other vendors' shapes:
 | `hold_key` | `text`, `duration` |
 | `wait` | `duration` → screenshot |
 | `computer_batch` | `actions: [{action, coordinate, start_coordinate, text, scroll_direction, scroll_amount, duration, repeat, region}]` |
+| `switch_display` | `display`: connector name, `primary` or `all` → screenshot of that monitor; later coordinates refer to it |
+
+Left means the primary button and right the secondary. The compositor applies a
+left-handed setting to the virtual pointer like to any mouse, so `cua` reads it (KWin's
+per-device `leftHanded`, GNOME's `org.gnome.desktop.peripherals.mouse left-handed`,
+sway's `get_inputs`, Hyprland's `input:left_handed`) and swaps before sending; `doctor`
+shows the answer under `buttons`. Where none of those apply, set
+`KMSCUA_BUTTONS=swapped` (or `normal`) in the MCP server's environment. The CLI's
+`click`/`drag` take `--button primary|secondary` (the default, resolved the same way) or
+`left|right|middle` for a physical button.
 
 Extras that no vendor ships, kept as separate tools so the trained vocabulary stays
 intact. Every mutating action also accepts `settle: true` to append the settled screenshot.
@@ -160,6 +198,7 @@ cua click X Y [--button right] [--count 2]      cua move X Y
 cua drag X1 Y1 X2 Y2                            cua scroll X Y --dy 3
 cua key ctrl+shift+t                            cua type "hello"
 cua cursor | displays | status | wake | doctor
+cua layout [--clear] [--dry-run]                push the compositor's monitor arrangement
 cua record start [--name n] [--fps 15] [--max-side 1920] [--max-seconds 600]
 cua record stop [-o out.mp4] | status
 cua record sheet rec.mp4 -o sheet.png --tiles 6
@@ -283,8 +322,13 @@ dir says why. (Not tested in a cell here.)
   Headless works through `vkms` (see Virtual desktop); no VM guests whose scanout is
   host-rendered (virgl), no nested compositors, no remote sessions. A blanked output
   captures black; `cua wake` nudges it.
-- **One CRTC per screenshot.** Multi-monitor is not stitched yet; the input range already
-  spans all displays.
+- **Multi-monitor needs the compositor's layout, and only GNOME is asked.** Without it
+  (`cua layout` not run, another compositor) only the first CRTC is captured and, with
+  two monitors, pointer coordinates are off everywhere, because the compositor spreads
+  the ABS range over the whole desktop; `cua doctor` says so. Rotated outputs are
+  refused. The side monitors are resampled into the primary's pixel density for the
+  full-desktop view; `switch_display` or `zoom` read them at native resolution.
+  (xcua reads the layout from the X server's RandR monitors and needs none of this.)
 - **cuad's keyboard layout is US.** ASCII is typed through the virtual keyboard;
   anything else goes through the clipboard, which needs the session's Wayland or X
   socket to be discoverable from `/proc` (it is, from an SSH shell, for the same uid).
