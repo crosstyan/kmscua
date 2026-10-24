@@ -90,7 +90,7 @@ changed. `zoom` images never change the coordinates.
 | `zoom X0 Y0 X1 Y1 -o z.png` | Magnify a region, to read small text. |
 | `wait-stable` / `wait-change` `[--timeout 8000] [--region x,y,w,h]` | Wait until the screen stops changing / changes. Exit 3 on timeout is not an error (a caret blinks); `--region` watches one part. |
 | `focused` | Which window has the keyboard: title, class, pid. |
-| `wait-window [--name s] [--class s] [--painted] [--timeout ms]` | Wait until a window is mapped (and drawn into). Exit 3 on timeout. |
+| `wait-window [--name s] [--class s] [--painted] [--timeout ms]` | Wait until a window is mapped; `--painted`: until its area is not a single colour (a blank white page never counts, a toolbar counts before the page: follow with `wait-stable`). Exit 3 on timeout. |
 | `maximize [--class s]` | Make that window (default: the focused one) fill the screen. |
 | `batch '{"actions": [{"action": "left_click", "coordinate": [640, 360]}, {"action": "type", "text": "q"}]}'` | Several actions in one call, the MCP `computer_batch` shape; stops at the first failure. `batch -` reads stdin. |
 | `record start\|mark\|status\|stop\|frames` | Screen recording (see below). |

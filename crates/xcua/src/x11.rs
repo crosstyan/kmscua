@@ -860,14 +860,55 @@ pub fn uniform(rgba: &[u8]) -> bool {
     differ * 1000 < rgba.len() / 4
 }
 
-/// Make `w` fill the screen. With a WM, ask it through
-/// `_NET_WM_STATE_MAXIMIZED_{HORZ,VERT}`; if it ignores that (twm has no
-/// EWMH) or there is none, configure the window to the root size at 0,0.
+/// The rect `top` (a child of root: a WM's frame, or the client itself)
+/// covers on the screen, border included, and its border width.
+fn frame_rect(conn: &RustConnection, top: Window) -> Option<(i32, i32, u32, u32, u32)> {
+    let g = conn.get_geometry(top).ok()?.reply().ok()?;
+    let bw = g.border_width as u32;
+    Some((g.x as i32, g.y as i32, g.width as u32 + 2 * bw, g.height as u32 + 2 * bw, bw))
+}
+
+/// Whether the root window lists both maximize states in `_NET_SUPPORTED`
+/// (an EWMH window manager that will act on the request).
+fn supports_maximize(conn: &RustConnection, root: Window) -> bool {
+    let (Ok(supported), Ok(horz), Ok(vert)) = (
+        intern(conn, "_NET_SUPPORTED"),
+        intern(conn, "_NET_WM_STATE_MAXIMIZED_HORZ"),
+        intern(conn, "_NET_WM_STATE_MAXIMIZED_VERT"),
+    ) else {
+        return false;
+    };
+    let Some(r) = conn.get_property(false, root, supported, AtomEnum::ATOM, 0, 4096).ok().and_then(|c| c.reply().ok()) else {
+        return false;
+    };
+    let atoms: Vec<u32> = r.value32().map(|v| v.collect()).unwrap_or_default();
+    atoms.contains(&horz) && atoms.contains(&vert)
+}
+
+/// Make `w` fill the screen, decorations included and nothing off-screen.
+/// With an EWMH window manager that lists the maximize states in
+/// `_NET_SUPPORTED`, ask it; otherwise (twm, or no WM) configure the client
+/// to the screen minus its frame's decorations, at the top-left corner.
 /// Answers how it was done.
 pub fn maximize(conn: &RustConnection, root: Window, w: &AppWindow) -> Result<&'static str> {
     let rg = conn.get_geometry(root)?.reply()?;
-    let full = |a: &AppWindow| a.width >= rg.width as u32 * 95 / 100 && a.height >= rg.height as u32 * 90 / 100;
-    if has_wm(conn, root) {
+    let (rw, rh) = (rg.width as u32, rg.height as u32);
+    // The window wholly on the screen, its frame filling (nearly) all of it.
+    let covers = |a: &AppWindow| {
+        let visible = a.x >= 0 && a.y >= 0 && a.x as u32 + a.width <= rw && a.y as u32 + a.height <= rh;
+        visible && frame_rect(conn, a.top).is_some_and(|(_, _, fw, fh, _)| fw >= rw * 95 / 100 && fh >= rh * 90 / 100)
+    };
+    let wait = || {
+        let end = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+            if app_window(conn, root, w.top, w.client).is_some_and(|a| covers(&a)) {
+                return true;
+            }
+        }
+        false
+    };
+    if has_wm(conn, root) && supports_maximize(conn, root) {
         let state = intern(conn, "_NET_WM_STATE")?;
         let horz = intern(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?;
         let vert = intern(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?;
@@ -880,24 +921,33 @@ pub fn maximize(conn: &RustConnection, root: Window, w: &AppWindow) -> Result<&'
             ev,
         )?
         .check()?;
-        let end = Instant::now() + Duration::from_millis(1500);
-        while Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(50));
-            if app_window(conn, root, w.top, w.client).is_some_and(|a| full(&a)) {
-                return Ok("_NET_WM_STATE maximized");
-            }
+        if wait() {
+            return Ok("_NET_WM_STATE maximized");
         }
     }
-    let aux = xproto::ConfigureWindowAux::new().x(0).y(0).width(rg.width as u32).height(rg.height as u32);
+    // Decorations: how much larger the frame is than the client. Without
+    // a WM the frame is the client (its border only). twm reads the
+    // position as the frame's inside, so offset it by the frame's border to
+    // put the outer corner at 0,0.
+    let (_, _, fw, fh, fbw) = frame_rect(conn, w.top).ok_or_else(|| anyhow!("{:#x} has gone", w.top))?;
+    let (extra_w, extra_h) = (fw.saturating_sub(w.width), fh.saturating_sub(w.height));
+    let inset = if w.top == w.client { 0 } else { fbw as i32 };
+    let aux = xproto::ConfigureWindowAux::new()
+        .x(inset)
+        .y(inset)
+        .width(rw.saturating_sub(extra_w).max(1))
+        .height(rh.saturating_sub(extra_h).max(1));
     conn.configure_window(w.client, &aux)?.check().context("ConfigureWindow")?;
-    let end = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(50));
-        if app_window(conn, root, w.top, w.client).is_some_and(|a| full(&a)) {
-            return Ok("resized to the screen");
-        }
+    if wait() {
+        return Ok("resized to the screen");
     }
-    bail!("{} did not change size (the window manager may not allow it)", w.summary())
+    let now = app_window(conn, root, w.top, w.client);
+    let frame = frame_rect(conn, w.top).map(|(x, y, fw, fh, _)| format!("{fw}x{fh}+{x}+{y}")).unwrap_or_default();
+    bail!(
+        "{} did not fill the {rw}x{rh} screen: its frame is now {frame}, the window {} (the window manager may not allow it)",
+        w.summary(),
+        now.map(|a| format!("{}x{}+{}+{}", a.width, a.height, a.x, a.y)).unwrap_or_default()
+    )
 }
 
 /// Title, class, pid and geometry of `w`, one per line.

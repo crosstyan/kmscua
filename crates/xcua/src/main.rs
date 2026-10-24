@@ -229,6 +229,9 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         class: Option<String>,
+        /// Also wait until the window's screen area is not a single colour.
+        /// A blank white page never counts; a toolbar counts before the
+        /// page has drawn, so follow it with wait-stable.
         #[arg(long)]
         painted: bool,
         /// Milliseconds.

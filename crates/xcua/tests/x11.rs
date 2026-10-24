@@ -1198,9 +1198,32 @@ fn maximize_fills_the_screen() {
         let cli = Cli::new(dir.join("state"), None);
         cli.ok(&["up", "--size", "640x480", "--wm", "twm"]);
         let display = cli.env_display().unwrap();
-        let (_conn, _win) = app_window(&display, (100, 100, 200, 150), 0x336699, Some("xcuatest"));
-        let out = cli.ok(&["maximize", "--class", "xcuatest"]);
-        assert!(out.contains("resized to the screen") || out.contains("maximized"), "{out}");
+        let (conn, win) = app_window(&display, (100, 100, 200, 150), 0x336699, Some("xcuatest"));
+        let t0 = Instant::now();
+        let out = cli.ok(&["--json", "maximize", "--class", "xcuatest"]);
+        // twm lists no _NET_WM_STATE support: no 1.5 s EWMH attempt first.
+        assert!(t0.elapsed() < Duration::from_millis(1200), "maximize took {:?}", t0.elapsed());
+        let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(j["how"], "resized to the screen", "{out}");
+        // The whole frame (title bar included) is on the screen and fills it.
+        let root = conn.setup().roots[0].root;
+        let top = {
+            let mut w = win;
+            loop {
+                let t = conn.query_tree(w).unwrap().reply().unwrap();
+                if t.parent == root {
+                    break w;
+                }
+                w = t.parent;
+            }
+        };
+        let g = conn.get_geometry(top).unwrap().reply().unwrap();
+        let (fx, fy) = (g.x as i32, g.y as i32);
+        let (fw, fh) = (g.width as i32 + 2 * g.border_width as i32, g.height as i32 + 2 * g.border_width as i32);
+        assert!(fx >= 0 && fy >= 0 && fx + fw <= 640 && fy + fh <= 480, "frame {fw}x{fh}+{fx}+{fy} off the 640x480 screen");
+        assert!(fw >= 608 && fh >= 432, "frame {fw}x{fh} does not fill the screen");
+        let c = &j["window"];
+        assert!(c["y"].as_i64().unwrap() + c["height"].as_i64().unwrap() <= 480, "client bottom off-screen: {c}");
         drop(cli);
         let _ = std::fs::remove_dir_all(&dir);
     }
