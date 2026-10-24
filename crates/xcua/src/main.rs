@@ -2,8 +2,10 @@
 //!
 //! `xcua up` makes sure a display answers (starting an Xvfb if needed) and
 //! writes `DISPLAY=:N` to the state dir's `env` file for the agent's other
-//! processes; `xcua mcp` does the same and then serves the tools on stdio.
-//! The ownership rule for the Xvfb is in `xvfb.rs`.
+//! processes; `xcua mcp`, `screenshot` and `doctor` do the same first. The
+//! shell's `$DISPLAY` is never used unless `--display env` says so: the
+//! agent must not land on the user's screen by accident. The ownership rule
+//! for the Xvfb is in `xvfb.rs`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,21 +25,22 @@ struct Cli {
     /// [default: $XDG_STATE_HOME/xcua or ~/.local/state/xcua].
     #[arg(long, global = true, env = "XCUA_STATE_DIR")]
     state_dir: Option<PathBuf>,
-    /// X display to use (":N"); default: xcua's own Xvfb, then $DISPLAY.
+    /// X display to use: ":N", or "env" for the shell's $DISPLAY. Without
+    /// it xcua uses its own Xvfb (started if needed) and never $DISPLAY.
     #[arg(long, global = true)]
     display: Option<String>,
+    /// Screen size if an Xvfb has to be started.
+    #[arg(long, global = true, default_value = "1920x1080")]
+    size: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Make sure a display answers: attach to one, or start an Xvfb that
-    /// stays until `xcua down`. Idempotent.
-    Up {
-        #[arg(long, default_value = "1920x1080")]
-        size: String,
-    },
+    /// Make sure a display answers: attach to --display, or start an Xvfb
+    /// that stays until `xcua down`. Idempotent.
+    Up,
     /// Stop the Xvfb xcua started and forget the display.
     Down,
     /// Display, Xvfb pid and owner, env file.
@@ -52,14 +55,12 @@ enum Cmd {
         /// `all`, or `core` for only the vendor-shaped tools.
         #[arg(long, default_value = "all")]
         tools: String,
-        /// Screen size if an Xvfb has to be started.
-        #[arg(long, default_value = "1920x1080")]
-        size: String,
         /// Capture through MIT-SHM (memfd), falling back to GetImage.
         #[arg(long, env = "XCUA_SHM")]
         shm: bool,
     },
-    /// Write one screenshot to a file (PNG, or JPEG for .jpg/--jpeg).
+    /// Write one screenshot to a file (PNG, or JPEG for .jpg/--jpeg). Starts
+    /// an Xvfb like `up` when none is running.
     Screenshot {
         #[arg(short, long)]
         output: PathBuf,
@@ -72,7 +73,8 @@ enum Cmd {
         #[arg(long, env = "XCUA_SHM")]
         shm: bool,
     },
-    /// Display, extensions, capture path, focus, recording dir.
+    /// Display, extensions, capture path, focus, recording dir. Starts an
+    /// Xvfb like `up` when none is running.
     Doctor,
 }
 
@@ -82,15 +84,13 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let state = State::new(cli.state_dir.clone())?;
-    let display = cli.display.as_deref();
+    let display = xvfb::explicit(cli.display.as_deref())?;
+    let display = display.as_deref();
+    let size = xvfb::parse_size(&cli.size)?;
     match &cli.cmd {
-        Cmd::Up { size } => {
-            let up = xvfb::up(&state, display, xvfb::parse_size(size)?, Owner::Up)?;
-            match &up {
-                Up::Attached { display } => println!("attached to {display}"),
-                Up::Reused { display, pid } => println!("already up: {display} (Xvfb pid {pid})"),
-                Up::Started { display, pid } => println!("started Xvfb on {display} (pid {pid})"),
-            }
+        Cmd::Up => {
+            let up = xvfb::up(&state, display, size, Owner::Up)?;
+            println!("{}", describe_up(&up));
             println!("DISPLAY={}  (also in {})", up.display(), state.env_path().display());
             Ok(())
         }
@@ -102,16 +102,16 @@ fn main() -> Result<()> {
             print!("{}", xvfb::status(&state));
             Ok(())
         }
-        Cmd::Mcp { max_side, tools, size, shm } => {
+        Cmd::Mcp { max_side, tools, shm } => {
             let core_only = match tools.as_str() {
                 "all" => false,
                 "core" => true,
                 other => bail!("--tools must be all or core, not {other}"),
             };
-            mcp(&state, display, xvfb::parse_size(size)?, *shm, *max_side, core_only)
+            mcp(&state, display, size, *shm, *max_side, core_only)
         }
         Cmd::Screenshot { output, max_side, jpeg, no_cursor, shm } => {
-            let d = xvfb::resolve(&state, display)?;
+            let d = ensure(&state, display, size)?;
             let mut cap = x11::Capture::open(&d, *shm)?;
             let shot = cap.grab(!no_cursor, None)?;
             let ext_jpeg = matches!(output.extension().and_then(|e| e.to_str()), Some("jpg" | "jpeg"));
@@ -131,8 +131,26 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Doctor => doctor(&state, display),
+        Cmd::Doctor => doctor(&state, display, size),
     }
+}
+
+fn describe_up(up: &Up) -> String {
+    match up {
+        Up::Attached { display } => format!("attached to {display}"),
+        Up::Reused { display, pid } => format!("already up: {display} (Xvfb pid {pid})"),
+        Up::Started { display, pid } => format!("started Xvfb on {display} (pid {pid}); it stays until `xcua down`"),
+    }
+}
+
+/// `up` for a one-shot command: the display, and a line on stderr when an
+/// Xvfb had to be started (it stays, as after `xcua up`).
+fn ensure(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<String> {
+    let up = xvfb::up(state, display, size, Owner::Up)?;
+    if matches!(up, Up::Started { .. }) {
+        eprintln!("{}", describe_up(&up));
+    }
+    Ok(up.display().to_string())
 }
 
 fn mcp(state: &State, display: Option<&str>, size: (u32, u32), shm: bool, max_side: Option<u32>, core_only: bool) -> Result<()> {
@@ -178,15 +196,16 @@ fn instructions(display: &str, state: &State) -> String {
     )
 }
 
-fn doctor(state: &State, display: Option<&str>) -> Result<()> {
-    print!("{}", xvfb::status(state));
-    let d = match xvfb::resolve(state, display) {
+fn doctor(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<()> {
+    let d = match ensure(state, display, size) {
         Ok(d) => d,
         Err(e) => {
+            print!("{}", xvfb::status(state));
             println!("display: unavailable: {e:#}");
             return Ok(());
         }
     };
+    print!("{}", xvfb::status(state));
     let b = XBackend::open(&d, std::env::var_os("XCUA_SHM").is_some(), &state.recordings())?;
     let r = b.doctor_report();
     let s = |k: &str| r[k].as_str().unwrap_or("?").to_string();

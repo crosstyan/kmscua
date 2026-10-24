@@ -11,11 +11,13 @@
 //! - `xvfb.log`: the Xvfb's stderr.
 //! - `recordings/`: stills recordings.
 //!
-//! Which display `up` picks, first that answers wins: `--display`, the
-//! display in the state dir when its Xvfb is alive, `$DISPLAY`, else a new
-//! Xvfb. A new Xvfb picks its own number (`-displayfd`), listens on no TCP
-//! port and runs in its own session, so it outlives the process that
-//! started it.
+//! Which display `up` picks: `--display :N` when given (`--display env`
+//! spells out "the shell's `$DISPLAY`"), else the Xvfb in the state dir when
+//! it is alive, else a new Xvfb. `$DISPLAY` is never used implicitly: the
+//! agent's tools must not land on the user's real screen because a shell
+//! happened to export it. A new Xvfb picks its own number (`-displayfd`),
+//! listens on no TCP port and runs in its own session, so it outlives the
+//! process that started it.
 //!
 //! The ownership rule: an Xvfb started by `xcua up` stays until `xcua
 //! down`. One that `xcua mcp` had to start itself is stopped when that
@@ -254,8 +256,23 @@ pub fn spawn(size: (u32, u32), log: Option<&Path>) -> Result<(Child, String)> {
     Ok((child, display))
 }
 
+/// The `--display` value as a display name: `env` means the shell's
+/// `$DISPLAY`, the one spelled-out way to reach it.
+pub fn explicit(display: Option<&str>) -> Result<Option<String>> {
+    match display {
+        None => Ok(None),
+        Some("env") => std::env::var("DISPLAY")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(Some)
+            .ok_or_else(|| anyhow!("--display env, but $DISPLAY is not set")),
+        Some(d) => Ok(Some(d.to_string())),
+    }
+}
+
 /// Make sure a display answers, starting an Xvfb if none does (see the
-/// module doc for the order and the ownership rule).
+/// module doc for the order and the ownership rule). `display` is the
+/// `--display` flag, already through [`explicit`]. `$DISPLAY` plays no part.
 pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) -> Result<Up> {
     if let Some(d) = display {
         if !answers(d) {
@@ -272,10 +289,6 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
     }
     // Whatever the state dir said is stale now.
     state.clear();
-    if let Some(d) = std::env::var("DISPLAY").ok().filter(|d| answers(d)) {
-        state.write(&d, None, None)?;
-        return Ok(Up::Attached { display: d });
-    }
     let (child, display) = spawn(size, Some(&state.log_path()))?;
     let pid = child.id();
     // Not waited for: it outlives us, and init reaps it.
@@ -334,24 +347,6 @@ fn stop(pid: u32) {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
     }
-}
-
-/// The display for a command that needs one but must not start one:
-/// `--display`, xcua's live Xvfb, then `$DISPLAY`.
-pub fn resolve(state: &State, display: Option<&str>) -> Result<String> {
-    if let Some(d) = display {
-        return if answers(d) { Ok(d.to_string()) } else { bail!("no X server answers on {d}") };
-    }
-    if let Some((d, _)) = state.live() {
-        return Ok(d);
-    }
-    if let Some(d) = state.display().filter(|d| answers(d)) {
-        return Ok(d);
-    }
-    if let Some(d) = std::env::var("DISPLAY").ok().filter(|d| answers(d)) {
-        return Ok(d);
-    }
-    bail!("no X display: run `xcua up` (or pass --display)")
 }
 
 /// One paragraph for `xcua status`.

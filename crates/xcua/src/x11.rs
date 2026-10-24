@@ -35,6 +35,17 @@ pub fn connect(display: &str) -> Result<(RustConnection, Window)> {
     Ok((conn, root))
 }
 
+/// The root window's size, refusing an empty one: an X server with no
+/// output (Xwayland before its first monitor, say) reports 0x0, and no
+/// screenshot or pointer coordinate makes sense on it.
+pub fn root_size(conn: &RustConnection, root: Window, display: &str) -> Result<(u32, u32)> {
+    let g = conn.get_geometry(root).context("GetGeometry on the root window")?.reply()?;
+    if g.width == 0 || g.height == 0 {
+        bail!("the root window of {display} is {}x{}: the server has no usable screen", g.width, g.height);
+    }
+    Ok((g.width as u32, g.height as u32))
+}
+
 /// Which of the extensions xcua cares about the server has, in a fixed order.
 pub fn extensions(conn: &RustConnection) -> Vec<(&'static str, bool)> {
     ["XTEST", "XFIXES", "MIT-SHM", "RANDR", "GLX", "RENDER", "XKEYBOARD"]
@@ -53,7 +64,17 @@ struct PixelFormat {
 }
 
 impl PixelFormat {
-    fn of(conn: &RustConnection, root: Window) -> Result<Self> {
+    /// Whether xcua can read a root of this depth, pixel size and visual.
+    fn check(display: &str, depth: u8, bpp: u8, red_mask: u32, class: xproto::VisualClass) -> Result<()> {
+        if !matches!(bpp, 16 | 24 | 32) || red_mask == 0 {
+            bail!(
+                "unsupported root visual on {display}: depth {depth}, {bpp} bpp, class {class:?} (xcua needs TrueColor or DirectColor at 16, 24 or 32 bpp)"
+            );
+        }
+        Ok(())
+    }
+
+    fn of(conn: &RustConnection, root: Window, display: &str) -> Result<Self> {
         let setup = conn.setup();
         let screen = setup
             .roots
@@ -72,13 +93,7 @@ impl PixelFormat {
             .flat_map(|d| d.visuals.iter())
             .find(|v| v.visual_id == screen.root_visual)
             .ok_or_else(|| anyhow!("root visual not in setup"))?;
-        if !matches!(fmt.bits_per_pixel, 16 | 24 | 32) || visual.red_mask == 0 {
-            bail!(
-                "unsupported root visual: depth {depth}, {} bpp, class {:?} (xcua needs TrueColor 16/24/32 bpp)",
-                fmt.bits_per_pixel,
-                visual.class
-            );
-        }
+        Self::check(display, depth, fmt.bits_per_pixel, visual.red_mask, visual.class)?;
         Ok(Self {
             bpp: fmt.bits_per_pixel,
             pad: fmt.scanline_pad,
@@ -95,6 +110,9 @@ impl PixelFormat {
 
     /// ZPixmap bytes to tightly packed opaque RGBA.
     fn convert(&self, data: &[u8], w: u32, h: u32) -> Result<RgbaImage> {
+        if w == 0 || h == 0 {
+            bail!("cannot convert an empty {w}x{h} image");
+        }
         let stride = self.stride(w);
         if data.len() < stride * h as usize {
             bail!("image data short: {} bytes for {w}x{h} at stride {stride}", data.len());
@@ -198,6 +216,7 @@ impl ShmSeg {
 pub struct Capture {
     conn: RustConnection,
     root: Window,
+    display: String,
     format: PixelFormat,
     xfixes: bool,
     /// Whether to try SHM at all (opt-in); cleared on the first failure.
@@ -208,7 +227,7 @@ pub struct Capture {
 impl Capture {
     pub fn open(display: &str, shm: bool) -> Result<Self> {
         let (conn, root) = connect(display)?;
-        let format = PixelFormat::of(&conn, root)?;
+        let format = PixelFormat::of(&conn, root, display)?;
         // XFIXES answers nothing before the client states its version.
         let xfixes = conn.extension_information("XFIXES")?.is_some()
             && conn.xfixes_query_version(5, 0)?.reply().is_ok();
@@ -222,7 +241,10 @@ impl Capture {
         if shm && !want_shm {
             log::info!("MIT-SHM 1.2 not available, using GetImage");
         }
-        Ok(Self { conn, root, format, xfixes, want_shm, shm: None })
+        let cap = Self { conn, root, display: display.to_string(), format, xfixes, want_shm, shm: None };
+        // Fail at open, with the reason, rather than on the first request.
+        cap.size()?;
+        Ok(cap)
     }
 
     pub fn cursor_supported(&self) -> bool {
@@ -236,8 +258,7 @@ impl Capture {
 
     /// Root window size now (RandR may have changed it since connect).
     pub fn size(&self) -> Result<(u32, u32)> {
-        let g = self.conn.get_geometry(self.root)?.reply()?;
-        Ok((g.width as u32, g.height as u32))
+        root_size(&self.conn, self.root, &self.display)
     }
 
     pub fn desktop(&self) -> Result<Rect> {
@@ -558,4 +579,39 @@ pub fn focused_text(conn: &RustConnection, root: Window) -> Result<String> {
         w if w == root => "source: GetInputFocus\nfocus: root window\n".to_string(),
         w => format!("source: GetInputFocus\n{}", describe(conn, root, w)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_visual_is_an_error_naming_the_display() {
+        let e = PixelFormat::check(":9", 8, 8, 0, xproto::VisualClass::PSEUDO_COLOR).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains(":9") && msg.contains("8 bpp"), "{msg}");
+        assert!(PixelFormat::check(":9", 24, 32, 0xff0000, xproto::VisualClass::TRUE_COLOR).is_ok());
+        assert!(PixelFormat::check(":9", 16, 16, 0xf800, xproto::VisualClass::TRUE_COLOR).is_ok());
+    }
+
+    #[test]
+    fn convert_refuses_empty_and_short_images() {
+        let f = PixelFormat { bpp: 32, pad: 32, msb_first: false, masks: [0xff0000, 0xff00, 0xff] };
+        assert!(f.convert(&[], 0, 0).is_err());
+        assert!(f.convert(&[0; 4], 2, 2).is_err());
+        let img = f.convert(&[1, 2, 3, 0], 1, 1).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn convert_handles_other_layouts() {
+        // 16 bpp RGB565, little-endian: pure red.
+        let f = PixelFormat { bpp: 16, pad: 32, msb_first: false, masks: [0xf800, 0x07e0, 0x001f] };
+        let img = f.convert(&[0x00, 0xf8, 0, 0], 1, 1).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        // 32 bpp big-endian x8r8g8b8: pure blue.
+        let f = PixelFormat { bpp: 32, pad: 32, msb_first: true, masks: [0xff0000, 0xff00, 0xff] };
+        let img = f.convert(&[0, 0, 0, 0xff], 1, 1).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 255, 255]);
+    }
 }

@@ -235,3 +235,43 @@ fn unknown_key_is_an_error_not_ok() {
         .call(&Request::Screenshot { max_side: None, format: ImageFormat::Png, quality: None, cursor: None, region: Some(Rect { x: 9000, y: 0, width: 5, height: 5 }) })
         .is_err());
 }
+
+/// `$DISPLAY` in the environment must not be used unless `--display env`
+/// asks for it: `up` starts its own Xvfb next to the decoy, `--display :N`
+/// attaches to the one named, and nothing is left running.
+#[test]
+fn display_env_is_never_implicit() {
+    let Some(decoy) = xvfb("policy") else { return };
+    let bin = env!("CARGO_BIN_EXE_xcua");
+    let state = decoy.dir.join("state");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("DISPLAY", &decoy.display)
+            .output()
+            .expect("run xcua");
+        assert!(out.status.success(), "xcua {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let up = run(&["--size", "320x240", "up"]);
+    assert!(up.contains("started Xvfb"), "{up}");
+    let env = std::fs::read_to_string(state.join("env")).unwrap();
+    let own = env.trim().strip_prefix("DISPLAY=").unwrap().to_string();
+    assert_ne!(own, decoy.display, "attached to $DISPLAY: {env}");
+    let shot = decoy.dir.join("own.png");
+    run(&["screenshot", "-o", shot.to_str().unwrap()]);
+    assert_eq!(image::image_dimensions(&shot).unwrap(), (320, 240), "screenshot came from the decoy");
+    let down = run(&["down"]);
+    assert!(down.contains("stopped Xvfb"), "{down}");
+
+    // Named on purpose: attach, screenshot the decoy, leave it alone.
+    let up = run(&["--display", &decoy.display, "up"]);
+    assert!(up.contains("attached to"), "{up}");
+    run(&["--display", "env", "screenshot", "-o", shot.to_str().unwrap()]);
+    assert_eq!(image::image_dimensions(&shot).unwrap(), (640, 480));
+    let down = run(&["down"]);
+    assert!(down.contains("left running"), "{down}");
+    assert!(xcua::xvfb::answers(&decoy.display));
+}

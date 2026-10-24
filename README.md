@@ -203,22 +203,26 @@ keyboard. Design, the two Jetson quirks (5.18 vkms sources on a 5.15 tree, a lib
 ## Sandboxes without a GPU (xcua)
 
 `xcua` serves the same MCP tools from one unprivileged process with no daemon and no
-socket of its own: it owns an Xvfb (or attaches to an X server that answers), captures
+socket of its own: it owns an Xvfb (or attaches to the X server `--display` names), captures
 the root window with `GetImage` (MIT-SHM through a memfd with `--shm`), composites the
 XFIXES cursor, and injects input through XTEST. It links no libxcb and builds as a
 static musl binary, for agent cells with no GPU, DRM, uinput or listening ports, and for
 bwrap sandboxes.
 
 ```
-xcua up [--size 1920x1080]          # attach, or start Xvfb; writes DISPLAY=:N to the env file
+xcua up [--size 1920x1080]          # start Xvfb (or reuse xcua's); writes DISPLAY=:N to the env file
 . ~/.local/state/xcua/env && xterm & # apps the agent starts read the env file
-claude mcp add xcua -- xcua mcp      # auto-ups if nothing answers
+claude mcp add xcua -- xcua mcp      # auto-ups if xcua's Xvfb is not running
 xcua screenshot -o shot.png | doctor | status | down
+xcua --display :1 doctor             # an existing server, named on purpose; `--display env` = $DISPLAY
 ```
 
-An Xvfb started by `xcua up` stays until `xcua down`; one that `xcua mcp` had to start
-stops when that `mcp` exits. State (env file, pidfile, owner, Xvfb log, recordings)
-lives in `--state-dir`, default `$XDG_STATE_HOME/xcua`. With no window manager, every
+`xcua` never uses the shell's `$DISPLAY` on its own: without `--display` every command
+uses xcua's own Xvfb, starting one when needed, so an agent cannot land on the user's
+screen because a shell exported it. An Xvfb started by `xcua up` (or by `screenshot` or
+`doctor`) stays until `xcua down`; one that `xcua mcp` had to start stops when that
+`mcp` exits. State (env file, pidfile, owner, Xvfb log, recordings) lives in
+`--state-dir`, default `$XDG_STATE_HOME/xcua`. With no window manager, every
 click gives the window under the pointer the keyboard. `type` takes any Unicode text:
 characters outside the keymap are bound to a spare keycode for the request (xdotool's
 trick), so no clipboard tool is needed. Recordings are JPEG stills, not MP4.

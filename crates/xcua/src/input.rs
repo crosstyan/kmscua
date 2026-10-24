@@ -30,6 +30,7 @@ use crate::x11;
 pub struct Input {
     conn: RustConnection,
     root: Window,
+    display: String,
     /// Pause between press and release, and between clicks.
     tap_ms: u64,
     /// Spare keycodes currently bound by us, to unbind on any exit path.
@@ -48,7 +49,8 @@ impl Input {
             bail!("the X server on {display} has no XTEST extension; input is impossible");
         }
         conn.xtest_get_version(2, 2)?.reply().context("XTEST GetVersion")?;
-        Ok(Self { conn, root, tap_ms: 30, borrowed: Vec::new() })
+        x11::root_size(&conn, root, display)?;
+        Ok(Self { conn, root, display: display.to_string(), tap_ms: 30, borrowed: Vec::new() })
     }
 
     pub fn conn(&self) -> &RustConnection {
@@ -90,14 +92,12 @@ impl Input {
     }
 
     fn desktop(&self) -> Result<Rect> {
-        let g = self.conn.get_geometry(self.root)?.reply()?;
-        Ok(Rect { x: 0, y: 0, width: g.width as u32, height: g.height as u32 })
+        let (w, h) = x11::root_size(&self.conn, self.root, &self.display)?;
+        Ok(Rect { x: 0, y: 0, width: w, height: h })
     }
 
     pub fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
-        let d = self.desktop()?;
-        let x = x.clamp(d.x, d.x + d.width as i32 - 1);
-        let y = y.clamp(d.y, d.y + d.height as i32 - 1);
+        let (x, y) = clamp_point(x, y, self.desktop()?)?;
         self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x as i16, y as i16)
     }
 
@@ -440,10 +440,36 @@ impl Drop for Input {
     }
 }
 
+/// `(x, y)` kept inside `d`, as cuad's ABS range does. An empty desktop
+/// has no pixel to land on, which is an error rather than a panic.
+fn clamp_point(x: i32, y: i32, d: Rect) -> Result<(i32, i32)> {
+    if d.width == 0 || d.height == 0 {
+        bail!("desktop is {}x{}: nowhere to move the pointer", d.width, d.height);
+    }
+    Ok((
+        x.clamp(d.x, d.x + d.width as i32 - 1),
+        y.clamp(d.y, d.y + d.height as i32 - 1),
+    ))
+}
+
 fn button_code(b: Button) -> u8 {
     match b {
         Button::Left => 1,
         Button::Middle => 2,
         Button::Right => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_point_clips_and_refuses_an_empty_desktop() {
+        let d = Rect { x: 0, y: 0, width: 640, height: 480 };
+        assert_eq!(clamp_point(-5, 5000, d).unwrap(), (0, 479));
+        assert_eq!(clamp_point(10, 20, d).unwrap(), (10, 20));
+        assert!(clamp_point(0, 0, Rect { x: 0, y: 0, width: 0, height: 0 }).is_err());
+        assert!(clamp_point(0, 0, Rect { x: 0, y: 0, width: 10, height: 0 }).is_err());
     }
 }
