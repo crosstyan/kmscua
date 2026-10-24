@@ -12,8 +12,8 @@
 //! under `bwrap --unshare-ipc`; any failure to set it up or to use it drops
 //! back to `GetImage` for the rest of the connection's life.
 
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::time::Instant;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use image::RgbaImage;
@@ -23,9 +23,134 @@ use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, Window};
-use x11rb::rust_connection::RustConnection;
+use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
+use x11rb::utils::RawFdContainer;
+use x11rb::wrapper::ConnectionExt as _;
 
 use crate::pixels::{self, Shot};
+
+/// x11rb's stream with a deadline on every wait: a server that is stopped
+/// (SIGSTOP) or wedged accepts the socket and then never answers, and a
+/// plain connection would wait for it forever.
+pub struct DeadlineStream {
+    inner: DefaultStream,
+    deadline: Instant,
+}
+
+impl Stream for DeadlineStream {
+    fn poll(&self, mode: PollMode) -> std::io::Result<()> {
+        let mut events = 0;
+        if mode.readable() {
+            events |= libc::POLLIN;
+        }
+        if mode.writable() {
+            events |= libc::POLLOUT;
+        }
+        loop {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "X server did not answer in time"));
+            }
+            let mut pfd = libc::pollfd { fd: self.inner.as_raw_fd(), events, revents: 0 };
+            let r = unsafe { libc::poll(&mut pfd, 1, left.as_millis().clamp(1, i32::MAX as u128) as i32) };
+            if r > 0 {
+                return Ok(());
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn read(&self, buf: &mut [u8], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.inner.read(buf, fds)
+    }
+
+    fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.inner.write(buf, fds)
+    }
+
+    fn write_vectored(&self, bufs: &[std::io::IoSlice<'_>], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.inner.write_vectored(bufs, fds)
+    }
+}
+
+/// A connection whose setup and every later reply must arrive within
+/// `timeout` of now, for liveness and identity probes. Same address order
+/// and authentication as `RustConnection::connect`.
+pub fn connect_within(display: &str, timeout: Duration) -> Result<(RustConnection<DeadlineStream>, Window)> {
+    use x11rb::reexports::x11rb_protocol::{parse_display::parse_display, xauth::get_auth};
+    let deadline = Instant::now() + timeout;
+    let parsed = parse_display(Some(display)).map_err(|e| anyhow!("bad display {display:?}: {e:?}"))?;
+    let screen = parsed.screen as usize;
+    let mut last = None;
+    for addr in parsed.connect_instruction() {
+        // connect(2) on a unix socket does not block on a stopped server
+        // (the kernel's backlog accepts), so only what follows needs the
+        // deadline.
+        let (inner, (family, address)) = match DefaultStream::connect(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        let (name, data) = get_auth(family, &address, parsed.display).ok().flatten().unwrap_or_default();
+        let conn = RustConnection::connect_to_stream_with_auth_info(DeadlineStream { inner, deadline }, screen, name, data)
+            .with_context(|| format!("X connection setup on {display}"))?;
+        let root = conn.setup().roots.get(screen).ok_or_else(|| anyhow!("no screen {screen} on {display}"))?.root;
+        return Ok((conn, root));
+    }
+    Err(anyhow!("no X server on {display}: {}", last.map(|e| e.to_string()).unwrap_or_else(|| "no address".into())))
+}
+
+/// The root-window property that identifies an X server instance: set by
+/// xcua right after it starts an Xvfb, or by the backend on a display that
+/// has none, and lost when the server restarts or resets.
+pub const NONCE_PROPERTY: &str = "_XCUA_NONCE";
+
+/// A fresh random identity.
+pub fn new_nonce() -> String {
+    let mut b = [0u8; 16];
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n != b.len() as isize {
+        // No getrandom: time and pid are unique enough for an identity.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        b[..8].copy_from_slice(&(t.as_nanos() as u64).to_le_bytes());
+        b[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub fn read_nonce<C: Connection>(conn: &C, root: Window) -> Option<String> {
+    let atom = conn.intern_atom(true, NONCE_PROPERTY.as_bytes()).ok()?.reply().ok()?.atom;
+    if atom == x11rb::NONE {
+        return None;
+    }
+    let r = conn.get_property(false, root, atom, AtomEnum::STRING, 0, 64).ok()?.reply().ok()?;
+    (r.type_ != x11rb::NONE && !r.value.is_empty()).then(|| String::from_utf8_lossy(&r.value).into_owned())
+}
+
+pub fn write_nonce<C: Connection>(conn: &C, root: Window, nonce: &str) -> Result<()> {
+    let atom = conn.intern_atom(false, NONCE_PROPERTY.as_bytes())?.reply()?.atom;
+    conn.change_property8(xproto::PropMode::REPLACE, root, atom, AtomEnum::STRING, nonce.as_bytes())?
+        .check()
+        .context("set the _XCUA_NONCE root property")?;
+    Ok(())
+}
+
+/// The server's identity, setting one when it has none.
+pub fn ensure_nonce<C: Connection>(conn: &C, root: Window) -> Result<String> {
+    if let Some(n) = read_nonce(conn, root) {
+        return Ok(n);
+    }
+    let n = new_nonce();
+    write_nonce(conn, root, &n)?;
+    Ok(n)
+}
 
 /// Connect to `display` (":N"), returning the connection and its root.
 pub fn connect(display: &str) -> Result<(RustConnection, Window)> {
@@ -177,7 +302,6 @@ impl ShmSeg {
             return Err(std::io::Error::last_os_error()).context("memfd_create");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        use std::os::fd::AsRawFd;
         if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } != 0 {
             return Err(std::io::Error::last_os_error()).context("ftruncate shm");
         }
@@ -250,6 +374,11 @@ impl Capture {
     /// Whether the connection still answers a round trip.
     pub fn alive(&self) -> bool {
         self.conn.get_input_focus().is_ok_and(|c| c.reply().is_ok())
+    }
+
+    /// This server's identity (`_XCUA_NONCE`), set if it has none.
+    pub fn nonce(&self) -> Result<String> {
+        ensure_nonce(&self.conn, self.root)
     }
 
     pub fn cursor_supported(&self) -> bool {

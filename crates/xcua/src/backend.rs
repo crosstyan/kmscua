@@ -14,9 +14,15 @@
 //! input lock so no other request sees keys left down.
 //!
 //! When the X server goes away (another `xcua mcp` stopped the Xvfb, it
-//! crashed), a failed request finds its connections dead, reconnects once,
-//! through the re-up hook when there is one so a new Xvfb is started, and
-//! retries; if that fails too the error names both causes.
+//! crashed), a failed request finds the connection it used dead and
+//! reconnects once, through the re-up hook when there is one so a new Xvfb
+//! is started. Only reads (screenshot, cursor, displays, status, ping) are
+//! retried. Input is never replayed: on a new server the windows it was
+//! aimed at are gone, so the request answers "the display was restarted"
+//! and nothing is sent. A server is told from a restarted one by the
+//! `_XCUA_NONCE` root property (see `x11::ensure_nonce`); when a retried
+//! read is what discovers the restart, the next input request carries the
+//! message instead.
 
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -64,6 +70,11 @@ pub struct XBackend {
     /// Shared with every `Input`: raised at shutdown to cut holds short.
     cancel: Arc<AtomicBool>,
     reup: Option<Reup>,
+    /// `_XCUA_NONCE` of the server we are connected to.
+    identity: Mutex<Option<String>>,
+    /// Set when a reconnect landed on a new server and no input request
+    /// has been told yet.
+    restarted: AtomicBool,
     rec: Mutex<RecSlot>,
     record_dir: PathBuf,
     started: Instant,
@@ -83,6 +94,7 @@ impl XBackend {
         let capture = Capture::open(display, shm)?;
         let input = Input::open(display)?;
         let cancel = input.canceller();
+        let identity = capture.nonce().map_err(|e| log::warn!("no server identity on {display}: {e:#}")).ok();
         Ok(Self {
             display: Mutex::new(display.to_string()),
             shm,
@@ -90,6 +102,8 @@ impl XBackend {
             input: Mutex::new(input),
             cancel,
             reup: None,
+            identity: Mutex::new(identity),
+            restarted: AtomicBool::new(false),
             rec: Mutex::new(RecSlot::default()),
             record_dir: record_dir.to_path_buf(),
             started: Instant::now(),
@@ -156,14 +170,26 @@ impl XBackend {
         }
     }
 
-    /// Both connections answer a round trip.
-    fn connected(&self) -> bool {
-        lock(&self.input).alive() && lock(&self.capture).alive()
+    /// Whether the connection `kind` uses is dead. Busy (another request
+    /// holds it, a `hold_key` say) counts as alive: never wait on it.
+    fn dead(&self, kind: Kind) -> bool {
+        fn probe<T>(m: &Mutex<T>, alive: impl Fn(&T) -> bool) -> bool {
+            match m.try_lock() {
+                Ok(g) => !alive(&g),
+                Err(TryLockError::Poisoned(p)) => !alive(&p.into_inner()),
+                Err(TryLockError::WouldBlock) => false,
+            }
+        }
+        match kind {
+            Kind::Input => probe(&self.input, Input::alive),
+            Kind::Read | Kind::Record => probe(&self.capture, Capture::alive),
+        }
     }
 
     /// New connections to the display the re-up hook answers (or the same
-    /// one), swapped in behind the locks so the recorder follows.
-    fn reconnect(&self) -> Result<String> {
+    /// one), swapped in behind the locks so the recorder follows. Answers
+    /// the display and whether it is the same server as before.
+    fn reconnect(&self) -> Result<(String, bool)> {
         let d = match &self.reup {
             Some(f) => f().context("re-up")?,
             None => self.display(),
@@ -171,11 +197,14 @@ impl XBackend {
         let cap = Capture::open(&d, self.shm)?;
         let mut inp = Input::open(&d)?;
         inp.set_canceller(self.cancel.clone());
+        let id = cap.nonce().ok();
+        let same = id.is_some() && *lock(&self.identity) == id;
         *lock(&self.capture) = cap;
         *lock(&self.input) = inp;
         *lock(&self.display) = d.clone();
-        log::warn!("reconnected to X display {d}");
-        Ok(d)
+        *lock(&self.identity) = id;
+        log::warn!("reconnected to X display {d} ({})", if same { "same server" } else { "a new server" });
+        Ok((d, same))
     }
 
     /// `dispatch` with panics turned into errors.
@@ -375,18 +404,69 @@ impl XBackend {
     }
 }
 
+/// Which connection a request uses, and whether it may be retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Input: never retried after a reconnect.
+    Input,
+    /// Idempotent reads on the capture connection: retried once.
+    Read,
+    /// Recording: on the capture connection, not retried.
+    Record,
+}
+
+impl Kind {
+    fn of(req: &Request) -> Self {
+        use Request::*;
+        match req {
+            Ping | Status | Displays | Screenshot { .. } | Cursor => Kind::Read,
+            RecordStart { .. } | RecordStop | RecordStatus => Kind::Record,
+            PointerMove { .. }
+            | PointerButton { .. }
+            | Click { .. }
+            | Drag { .. }
+            | Scroll { .. }
+            | Key { .. }
+            | KeyCombo { .. }
+            | KeyHold { .. }
+            | Type { .. }
+            | Wake => Kind::Input,
+        }
+    }
+}
+
+fn restarted_message(display: &str) -> String {
+    format!(
+        "the display was restarted: {display} is a new X server with none of the windows you had; relaunch your apps (DISPLAY={display}), then take a screenshot. This request was not sent."
+    )
+}
+
 impl Backend for XBackend {
     fn call(&self, req: &Request) -> Result<Reply> {
         self.served.fetch_add(1, Ordering::Relaxed);
+        let kind = Kind::of(req);
+        if kind == Kind::Input && self.restarted.swap(false, Ordering::Relaxed) {
+            bail!("{}", restarted_message(&self.display()));
+        }
         let (data, payload) = match self.call_once(req) {
             Ok(r) => r,
-            Err(e) if !self.connected() => {
+            Err(e) if self.dead(kind) => {
                 let lost = self.display();
-                match self.reconnect() {
-                    Ok(d) => self
-                        .call_once(req)
-                        .with_context(|| format!("X connection to {lost} was lost ({e:#}); retried on {d}"))?,
-                    Err(re) => bail!("X connection to {lost} was lost ({e:#}) and reconnecting failed: {re:#}"),
+                let (d, same) = self
+                    .reconnect()
+                    .map_err(|re| anyhow!("X connection to {lost} was lost ({e:#}) and reconnecting failed: {re:#}"))?;
+                match (kind, same) {
+                    (Kind::Read, _) => {
+                        if !same {
+                            self.restarted.store(true, Ordering::Relaxed);
+                        }
+                        self.call_once(req)
+                            .with_context(|| format!("X connection to {lost} was lost ({e:#}); retried on {d}"))?
+                    }
+                    (_, false) => bail!("{}", restarted_message(&d)),
+                    (_, true) => bail!(
+                        "X connection to {lost} was lost ({e:#}) and is back on the same server; this request was not repeated: check with a screenshot, then send it again"
+                    ),
                 }
             }
             Err(e) => return Err(e),

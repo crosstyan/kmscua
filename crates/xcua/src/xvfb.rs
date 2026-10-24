@@ -6,14 +6,33 @@
 //!
 //! - `env`: `export DISPLAY=:N`, for `. ~/.local/state/xcua/env`.
 //! - `xvfb.pid`: the Xvfb's pid and its start time (field 22 of
-//!   `/proc/<pid>/stat`), only when xcua started it. Nothing is signalled
-//!   unless the pid is in 2..=i32::MAX, `/proc/<pid>/comm` reads `Xvfb` and
-//!   the start time still matches.
+//!   `/proc/<pid>/stat`), only when xcua started it.
+//! - `nonce`: a random identity xcua sets as the `_XCUA_NONCE` property on
+//!   the root window of the Xvfb it starts. A display whose root carries it
+//!   is xcua's Xvfb, with or without `/proc` (bwrap `--tmpfs /proc`).
 //! - `owner`: `up`, or `mcp <pid>` for an Xvfb an `xcua mcp` started.
 //! - `users/<pid>`: one file per `xcua mcp` using xcua's Xvfb, holding that
 //!   process's start time.
 //! - `lock`: `flock`ed from every liveness check through the writes that
-//!   follow, so concurrent `xcua up`s start one Xvfb between them.
+//!   follow, so concurrent `xcua up`s start one Xvfb between them. Taken
+//!   with a 10 s deadline. Where the filesystem has no `flock`, `lock.excl`
+//!   (created O_EXCL, holding pid and start time) stands in, and is broken
+//!   when its holder is dead.
+//!
+//! Signals: with `/proc`, only when the pid is in 2..=i32::MAX, its `comm`
+//! reads `Xvfb` and its start time matches the pidfile. Without `/proc`,
+//! only when the pid is alive (`kill(pid, 0)`) and the display answers
+//! with xcua's nonce; SIGTERM is then not escalated to SIGKILL, and success
+//! means the display stopped answering. The residual risk without `/proc`:
+//! the nonce proves xcua's Xvfb is alive, not that the pidfile's pid is
+//! that Xvfb. They differ only if the state dir is shared between pid
+//! namespaces that share the X socket (two sandboxes over one home and one
+//! network namespace), where the pid may name another process.
+//!
+//! Every probe of a display has a 2 s deadline, so a stopped (SIGSTOP) or
+//! wedged Xvfb cannot hang `up`, `down` or an exiting `mcp`. With `/proc`,
+//! an Xvfb that is xcua's (pid and start time) but does not answer is
+//! killed before a new one is started.
 //! - `xvfb.log`: the Xvfb's stderr. `recordings/`: stills recordings.
 //!
 //! Which display a command uses: `--display :N` when given (`--display
@@ -41,6 +60,10 @@ use anyhow::{anyhow, bail, Context, Result};
 
 /// How long an Xvfb gets to report its display and answer.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a display gets to answer a probe.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a command waits for another xcua to let go of the state dir.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where xcua keeps its notes.
 #[derive(Clone, Debug)]
@@ -153,15 +176,43 @@ fn start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(22 - 3)?.parse().ok()
 }
 
+/// Alive, zombies excluded. A dead child of ours (an Xvfb this `mcp`
+/// started through a re-up) is reaped here, so it does not linger as a
+/// zombie that `kill(pid, 0)` still finds.
 fn alive(pid: u32) -> bool {
-    match valid_pid(pid as u64) {
-        Some(p) => unsafe { libc::kill(p, 0) == 0 },
-        None => false,
-    }
+    let Some(p) = valid_pid(pid as u64) else { return false };
+    unsafe { libc::waitpid(p, std::ptr::null_mut(), libc::WNOHANG) };
+    let exists = unsafe { libc::kill(p, 0) == 0 };
+    exists && !zombie(pid)
 }
 
-/// The state dir's `flock`, released on drop.
-pub struct StateLock(#[allow(dead_code)] fs::File);
+/// State `Z` in `/proc/<pid>/stat` (false without /proc).
+fn zombie(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with('Z')))
+        .unwrap_or(false)
+}
+
+/// Whether this process can see `/proc` (bwrap `--tmpfs /proc` hides it).
+pub fn have_proc() -> bool {
+    Path::new("/proc/self/stat").exists()
+}
+
+/// The state dir's lock, released on drop: a `flock`ed file, or an O_EXCL
+/// file removed on drop where the filesystem has no `flock`.
+pub enum StateLock {
+    Flock(#[allow(dead_code)] fs::File),
+    Excl(PathBuf),
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        if let StateLock::Excl(p) = self {
+            remove(p);
+        }
+    }
+}
 
 impl State {
     pub fn new(dir: Option<PathBuf>) -> Result<Self> {
@@ -187,6 +238,14 @@ impl State {
     fn owner_path(&self) -> PathBuf {
         self.dir.join("owner")
     }
+    fn nonce_path(&self) -> PathBuf {
+        self.dir.join("nonce")
+    }
+
+    /// The identity of xcua's Xvfb, as set on its root window.
+    pub fn nonce(&self) -> Option<String> {
+        fs::read_to_string(self.nonce_path()).ok().map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
+    }
     fn users_dir(&self) -> PathBuf {
         self.dir.join("users")
     }
@@ -197,9 +256,14 @@ impl State {
         self.dir.join("recordings")
     }
 
-    /// Take the state dir's lock, waiting for another xcua to finish.
+    /// Take the state dir's lock, waiting at most 10 s for another xcua.
     pub fn lock(&self) -> Result<StateLock> {
+        self.lock_within(LOCK_TIMEOUT)
+    }
+
+    pub fn lock_within(&self, timeout: Duration) -> Result<StateLock> {
         fs::create_dir_all(&self.dir).with_context(|| format!("create {}", self.dir.display()))?;
+        let deadline = Instant::now() + timeout;
         let path = self.dir.join("lock");
         // std opens with O_CLOEXEC: an Xvfb started under the lock does not
         // inherit it and hold it forever.
@@ -210,12 +274,61 @@ impl State {
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
         loop {
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(StateLock(f));
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(StateLock::Flock(f));
             }
             let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e).with_context(|| format!("flock {}", path.display()));
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EWOULDBLOCK) => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "the state dir {} is locked by another xcua (busy for {} s); is one stuck? `xcua status` shows it",
+                            self.dir.display(),
+                            timeout.as_secs()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => {
+                    log::info!("no flock on {} ({e}); using an O_EXCL lock file", path.display());
+                    return self.lock_excl(deadline);
+                }
+                _ => return Err(e).with_context(|| format!("flock {}", path.display())),
+            }
+        }
+    }
+
+    /// The fallback lock: `lock.excl` created O_EXCL with our pid and start
+    /// time, waited on until `deadline`, broken when its holder is dead.
+    pub fn lock_excl(&self, deadline: Instant) -> Result<StateLock> {
+        use std::io::Write;
+        let path = self.dir.join("lock.excl");
+        let me = Proc::now(std::process::id()).ok_or_else(|| anyhow!("own pid out of range"))?;
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    f.write_all(me.line().as_bytes()).with_context(|| format!("write {}", path.display()))?;
+                    return Ok(StateLock::Excl(path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder = fs::read_to_string(&path).ok().and_then(|t| Proc::parse(&t));
+                    if holder.is_some_and(|h| !h.is_same()) {
+                        log::warn!("breaking the stale lock {} of dead pid {}", path.display(), holder.unwrap().pid);
+                        remove(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "the state dir {} is locked by pid {} ({})",
+                            self.dir.display(),
+                            holder.map(|h| h.pid.to_string()).unwrap_or_else(|| "?".into()),
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
             }
         }
     }
@@ -234,12 +347,18 @@ impl State {
         Owner::parse(&fs::read_to_string(self.owner_path()).ok()?)
     }
 
-    fn write(&self, display: &str, pid: Option<Proc>, owner: Option<Owner>) -> Result<()> {
+    fn write(&self, display: &str, pid: Option<(Proc, &str)>, owner: Option<Owner>) -> Result<()> {
         fs::create_dir_all(&self.dir).with_context(|| format!("create {}", self.dir.display()))?;
         write_atomic(&self.env_path(), &format!("export DISPLAY={display}\n"))?;
         match pid {
-            Some(p) => write_atomic(&self.pid_path(), &p.line())?,
-            None => remove(&self.pid_path()),
+            Some((p, nonce)) => {
+                write_atomic(&self.pid_path(), &p.line())?;
+                write_atomic(&self.nonce_path(), &format!("{nonce}\n"))?;
+            }
+            None => {
+                remove(&self.pid_path());
+                remove(&self.nonce_path());
+            }
         }
         self.set_owner(owner)
     }
@@ -257,14 +376,20 @@ impl State {
     fn clear(&self) {
         remove(&self.env_path());
         remove(&self.pid_path());
+        remove(&self.nonce_path());
         remove(&self.owner_path());
         let _ = fs::remove_dir_all(self.users_dir());
     }
 
-    /// xcua's own Xvfb, if it is alive, the same process, and answers.
+    /// xcua's own Xvfb, if its display answers with xcua's nonce. Without a
+    /// recorded nonce (state from an older xcua), by pid and start time.
     pub fn live(&self) -> Option<(String, Proc)> {
         let (display, pid) = (self.display()?, self.pid()?);
-        (pid.is_xvfb() && answers(&display)).then_some((display, pid))
+        let ours = match self.nonce() {
+            Some(n) => nonce_of(&display).as_deref() == Some(n.as_str()),
+            None => pid.is_xvfb() && answers(&display),
+        };
+        ours.then_some((display, pid))
     }
 
     /// A display recorded by `up --display` (no pidfile) that answers.
@@ -337,9 +462,16 @@ fn remove(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-/// Whether an X server answers on `display` (a full connection setup).
+/// Whether an X server answers on `display`: a full connection setup
+/// within 2 s, so a stopped server counts as not answering.
 pub fn answers(display: &str) -> bool {
-    !display.is_empty() && x11rb::rust_connection::RustConnection::connect(Some(display)).is_ok()
+    !display.is_empty() && crate::x11::connect_within(display, ANSWER_TIMEOUT).is_ok()
+}
+
+/// The `_XCUA_NONCE` on `display`'s root, within 2 s.
+pub fn nonce_of(display: &str) -> Option<String> {
+    let (conn, root) = crate::x11::connect_within(display, ANSWER_TIMEOUT).ok()?;
+    crate::x11::read_nonce(&conn, root)
 }
 
 /// Start an Xvfb of `size` and wait until it answers, at most
@@ -498,13 +630,27 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
     if let Some(d) = state.attached() {
         return Ok(Up::Attached { display: d });
     }
+    // xcua's Xvfb by pid and start time, but not answering: stopped or
+    // wedged. Kill it rather than leave it behind.
+    if let Some(p) = state.pid().filter(|p| p.is_xvfb()) {
+        log::warn!("xcua's Xvfb (pid {}) does not answer; killing it", p.pid);
+        stop(&p, None, None);
+    }
     // Whatever the state dir said is stale now.
     state.clear();
-    let (child, display) = spawn(size, Some(&state.log_path()))?;
+    let (mut child, display) = spawn(size, Some(&state.log_path()))?;
     let proc = Proc::now(child.id()).ok_or_else(|| anyhow!("Xvfb pid {} out of range", child.id()))?;
+    let nonce = crate::x11::new_nonce();
+    let marked = crate::x11::connect_within(&display, ANSWER_TIMEOUT)
+        .and_then(|(conn, root)| crate::x11::write_nonce(&conn, root, &nonce));
+    if let Err(e) = marked {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.context(format!("mark the new Xvfb on {display}")));
+    }
     // Not waited for: it outlives us, and init reaps it.
     drop(child);
-    state.write(&display, Some(proc), Some(owner))?;
+    state.write(&display, Some((proc, &nonce)), Some(owner))?;
     if let Owner::Mcp(me) = owner {
         state.add_user(me)?;
     }
@@ -535,15 +681,26 @@ fn reuse(state: &State, owner: Owner, display: String, p: Proc) -> Result<Up> {
     Ok(Up::Reused { display, pid: p.pid })
 }
 
-/// Stop xcua's Xvfb (if it started one) and forget the display.
+/// Stop xcua's Xvfb (if it started one) and forget the display. With
+/// `/proc` this needs no X connection, so a stopped Xvfb is still killed.
 pub fn down(state: &State) -> Result<String> {
     let _lock = state.lock()?;
+    let nonce = state.nonce();
     let msg = match (state.pid(), state.display()) {
-        (Some(p), d) if p.is_xvfb() => {
-            stop(p);
-            format!("stopped Xvfb {} (pid {})", d.unwrap_or_default(), p.pid)
-        }
-        (Some(p), _) => format!("pid {} in {} is not xcua's Xvfb any more; not signalled", p.pid, state.pid_path().display()),
+        (Some(p), d) => match stop(&p, d.as_deref(), nonce.as_deref()) {
+            Stopped::Yes => format!("stopped Xvfb {} (pid {})", d.unwrap_or_default(), p.pid),
+            Stopped::NotOurs => {
+                format!("pid {} in {} is not xcua's Xvfb any more; not signalled", p.pid, state.pid_path().display())
+            }
+            Stopped::StillAnswering => {
+                // Keep the state: the Xvfb may still be there.
+                return Ok(format!(
+                    "sent SIGTERM to pid {} but {} still answers; without /proc xcua does not escalate (kill it yourself)",
+                    p.pid,
+                    d.unwrap_or_default()
+                ));
+            }
+        },
         (None, _) if state.pid_path().exists() => {
             format!("{} holds no usable pid; not signalled", state.pid_path().display())
         }
@@ -563,30 +720,57 @@ pub fn release(state: &State, me: u32) {
     if state.owner() == Some(Owner::Up) || !state.live_users().is_empty() {
         return;
     }
-    if p.is_xvfb() {
-        stop(p);
+    let nonce = state.nonce();
+    if stop(&p, state.display().as_deref(), nonce.as_deref()) != Stopped::StillAnswering {
+        state.clear();
     }
-    state.clear();
 }
 
-/// SIGTERM, then SIGKILL after 3 s; each signal only after re-checking
-/// that `p` is still the Xvfb the pidfile named.
-fn stop(p: Proc) {
-    let Some(pid) = valid_pid(p.pid as u64) else { return };
-    if !p.is_xvfb() {
-        return;
+#[derive(Debug, PartialEq, Eq)]
+enum Stopped {
+    Yes,
+    /// Not provably xcua's Xvfb: nothing was signalled.
+    NotOurs,
+    /// Without /proc: SIGTERM sent, the display still answers.
+    StillAnswering,
+}
+
+/// Stop xcua's Xvfb (see the module doc for when a signal is sent).
+/// `display` and `nonce` identify it where `/proc` cannot.
+fn stop(p: &Proc, display: Option<&str>, nonce: Option<&str>) -> Stopped {
+    let Some(pid) = valid_pid(p.pid as u64) else { return Stopped::NotOurs };
+    if have_proc() {
+        if !p.is_xvfb() {
+            return Stopped::NotOurs;
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while p.is_xvfb() && Instant::now() < deadline {
+            // Reap it if it is our child; harmless otherwise.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // SIGKILL also ends a stopped (SIGSTOP) process.
+        if p.is_xvfb() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+        return Stopped::Yes;
+    }
+    let (Some(display), Some(nonce)) = (display, nonce) else { return Stopped::NotOurs };
+    if !alive(p.pid) || nonce_of(display).as_deref() != Some(nonce) {
+        return Stopped::NotOurs;
     }
     unsafe { libc::kill(pid, libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while p.is_xvfb() && Instant::now() < deadline {
-        // Reap it if it is our child; harmless otherwise.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        std::thread::sleep(Duration::from_millis(50));
+        if !answers(display) {
+            return Stopped::Yes;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    if p.is_xvfb() {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-    }
+    Stopped::StillAnswering
 }
 
 /// One paragraph for `xcua status`.
@@ -607,7 +791,7 @@ pub fn status(state: &State) -> String {
             s.push_str(&format!(
                 "xvfb pid: {} ({}), owner: {}{}, mcp users: {}\n",
                 p.pid,
-                if p.is_xvfb() { "alive" } else { "gone" },
+                if p.is_xvfb() || (!have_proc() && state.live().is_some()) { "alive" } else { "gone" },
                 owner.map(|o| o.as_line()).unwrap_or_else(|| "?".into()),
                 if orphan { " (dead; the next `xcua up` or `mcp` adopts it)" } else { "" },
                 if users.is_empty() { "none".to_string() } else { format!("{users:?}") }
@@ -678,7 +862,7 @@ mod tests {
         let me = Proc::now(std::process::id()).unwrap();
         assert!(me.start.is_some());
         assert!(!me.is_xvfb());
-        st.write(":99", Some(me), Some(Owner::Up)).unwrap();
+        st.write(":99", Some((me, "n")), Some(Owner::Up)).unwrap();
         let msg = down(&st).unwrap();
         assert!(msg.contains("not signalled"), "{msg}");
         // A recorded start time that no longer matches is another process.
@@ -700,6 +884,29 @@ mod tests {
         assert_eq!(fs::read_dir(st.users_dir()).unwrap().count(), 1);
         st.remove_user(std::process::id());
         assert!(st.live_users().is_empty());
+        fs::remove_dir_all(&st.dir).unwrap();
+    }
+
+    #[test]
+    fn lock_has_a_deadline_and_an_excl_fallback() {
+        let st = tmp_state("lock");
+        let held = st.lock().unwrap();
+        let t0 = Instant::now();
+        let e = st.lock_within(Duration::from_millis(300)).err().expect("second lock while held");
+        assert!(format!("{e:#}").contains("locked by another xcua"), "{e:#}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        drop(held);
+        drop(st.lock_within(Duration::from_millis(300)).unwrap());
+
+        // The O_EXCL fallback: exclusive, freed on drop, broken when stale.
+        let a = st.lock_excl(Instant::now()).unwrap();
+        let e = st.lock_excl(Instant::now() + Duration::from_millis(200)).err().expect("excl lock while held");
+        assert!(format!("{e:#}").contains(&format!("pid {}", std::process::id())), "{e:#}");
+        drop(a);
+        assert!(!st.dir.join("lock.excl").exists());
+        // A holder that is not alive (start time cannot match): broken.
+        fs::write(st.dir.join("lock.excl"), format!("{} 1\n", std::process::id())).unwrap();
+        drop(st.lock_excl(Instant::now()).unwrap());
         fs::remove_dir_all(&st.dir).unwrap();
     }
 

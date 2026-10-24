@@ -225,11 +225,18 @@ only and leaves the state dir alone; `up --display` records the attach, and refu
 while xcua's own Xvfb runs. An Xvfb started by `xcua up` (or by `screenshot` or
 `doctor`) stays until `xcua down`. One that `xcua mcp` started is shared by every `mcp`
 that finds it and stops when the last one leaves; an `mcp` killed with SIGKILL is
-pruned by the next, which adopts the Xvfb. If the Xvfb dies under a running `mcp`, the
-next request starts or finds one again and retries once. A lock in the state dir
-serializes all of this, so concurrent `xcua up`s start one Xvfb. State (env file,
-pidfile with the Xvfb's start time, owner, users, Xvfb log, recordings) lives in
-`--state-dir`, default `$XDG_STATE_HOME/xcua`.
+pruned by the next, which adopts the Xvfb. If the Xvfb dies under a running `mcp`, it
+reconnects (starting a new one) and retries reads once; input is never replayed onto a
+new server: the request answers "the display was restarted; relaunch your apps". A
+lock in the state dir (10 s deadline, an O_EXCL file where there is no `flock`)
+serializes all of this, so concurrent `xcua up`s start one Xvfb. xcua knows its Xvfb
+by a random `_XCUA_NONCE` property on the root window, so this works without `/proc`
+(bwrap `--tmpfs /proc`); signals need `/proc` to confirm pid and start time, or, without
+it, a live pid and a matching nonce, and are then never escalated past SIGTERM (the
+residual risk, a state dir shared across pid namespaces, is in `xvfb.rs`). Every probe
+of a display gives up after 2 s, so a stopped Xvfb cannot hang `up`, `down` or an
+exiting `mcp`. State (env file, pidfile with the Xvfb's start time, nonce, owner,
+users, Xvfb log, recordings) lives in `--state-dir`, default `$XDG_STATE_HOME/xcua`.
 
 With no window manager, every click gives the top-level window under the pointer the
 keyboard (menus and other override-redirect windows excepted). `type` takes any Unicode

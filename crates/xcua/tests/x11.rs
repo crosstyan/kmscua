@@ -239,15 +239,24 @@ fn unknown_key_is_an_error_not_ok() {
 struct Cli {
     state: std::path::PathBuf,
     display_env: Option<String>,
+    /// Run every command under this (bwrap …), except the cleanup `down`.
+    wrap: Vec<String>,
 }
 
 impl Cli {
     fn new(state: std::path::PathBuf, display_env: Option<&str>) -> Self {
-        Self { state, display_env: display_env.map(str::to_string) }
+        Self { state, display_env: display_env.map(str::to_string), wrap: Vec::new() }
     }
 
     fn cmd(&self) -> std::process::Command {
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_xcua"));
+        let mut c = match self.wrap.split_first() {
+            Some((w, rest)) => {
+                let mut c = std::process::Command::new(w);
+                c.args(rest).arg(env!("CARGO_BIN_EXE_xcua"));
+                c
+            }
+            None => std::process::Command::new(env!("CARGO_BIN_EXE_xcua")),
+        };
         c.arg("--state-dir").arg(&self.state);
         match &self.display_env {
             Some(d) => c.env("DISPLAY", d),
@@ -299,13 +308,26 @@ impl Cli {
 
 impl Drop for Cli {
     fn drop(&mut self) {
+        // With /proc, so a test that failed under bwrap still cleans up.
+        self.wrap.clear();
+        if let Some(pid) = self.pid() {
+            // A test may have left it stopped.
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        }
         let _ = self.cmd().arg("down").output();
         let _ = std::fs::remove_dir_all(&self.state);
     }
 }
 
+/// Alive and not a zombie (an Xvfb the mcp started is its child, and stays
+/// a zombie until the mcp reaps it).
 fn alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with('Z')))
+        .unwrap_or(false);
+    let exists = unsafe { libc::kill(pid, 0) == 0 };
+    exists && !zombie
 }
 
 fn wait_until(timeout: Duration, f: impl Fn() -> bool) -> bool {
@@ -513,12 +535,23 @@ fn mcp_users_share_adopt_and_reconnect() {
     let status = cli.ok(&["status"]);
     assert!(status.contains("owner: mcp "), "{status}");
 
-    // Kill the Xvfb under C: the next request reconnects to a new one.
+    // Kill the Xvfb under C: a read reconnects to a new one and answers,
+    // the next input request is told the display restarted, then input
+    // works on the new display.
     unsafe { libc::kill(pid, libc::SIGKILL) };
     assert!(wait_until(Duration::from_secs(5), || !alive(pid)));
     assert_eq!(c.tool("screenshot", serde_json::json!({})), "<image>", "no reconnect after the Xvfb died");
     let new_pid = cli.pid().unwrap();
     assert_ne!(new_pid, pid);
+    let click = c.tool("left_click", serde_json::json!({"coordinate": [10, 10]}));
+    assert!(click.contains("restarted"), "{click}");
+    assert_eq!(c.tool("left_click", serde_json::json!({"coordinate": [10, 10]})), "OK");
+    // Input first after a restart: refused, not replayed onto the new display.
+    unsafe { libc::kill(new_pid, libc::SIGKILL) };
+    assert!(wait_until(Duration::from_secs(5), || !alive(new_pid)));
+    let typed = c.tool("type", serde_json::json!({"text": "rm -rf"}));
+    assert!(typed.contains("restarted") && typed.contains("not sent"), "{typed}");
+    let new_pid = cli.pid().unwrap();
     c.finish();
     assert!(wait_until(Duration::from_secs(5), || !alive(new_pid)), "last mcp did not stop the Xvfb");
     drop(cli);
@@ -601,4 +634,81 @@ fn click_does_not_focus_override_redirect() {
     conn.get_input_focus().unwrap().reply().unwrap();
     b.call(&Request::Click { x: 450, y: 350, button: Button::Left, count: 1, modifiers: vec![] }).unwrap();
     assert_eq!(conn.get_input_focus().unwrap().reply().unwrap().focus, win, "focus went to the override-redirect window");
+}
+
+/// Without /proc (bwrap --tmpfs /proc) xcua still knows its own Xvfb by the
+/// nonce on its root window: three `up`s start one, `down` stops it.
+#[test]
+fn no_proc_recognises_its_xvfb_by_nonce() {
+    let have_bwrap = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("bwrap").is_file()))
+        .unwrap_or(false);
+    if !have_xvfb() || !have_bwrap {
+        eprintln!("bwrap or Xvfb missing; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-noproc-{}", std::process::id()));
+    let mut cli = Cli::new(dir.join("state"), None);
+    cli.wrap = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/proc"].map(String::from).to_vec();
+    let (ok, probe) = cli.run(&["status"]);
+    assert!(ok, "xcua under bwrap: {probe}");
+    let first = cli.ok(&["--size", "320x240", "up"]);
+    assert!(first.contains("started Xvfb"), "{first}");
+    let pid = cli.pid().unwrap();
+    for _ in 0..2 {
+        let again = cli.ok(&["up"]);
+        assert!(again.contains("already up"), "{again}");
+    }
+    assert_eq!(cli.pid(), Some(pid));
+    let shot = dir.join("s.png");
+    cli.ok(&["screenshot", "-o", shot.to_str().unwrap()]);
+    let display = cli.env_display().unwrap();
+    let down = cli.ok(&["down"]);
+    assert!(down.contains("stopped Xvfb"), "{down}");
+    assert!(!xcua::xvfb::answers(&display));
+    assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stopped (SIGSTOP) Xvfb cannot hang `up` or `down`: probes time out,
+/// and with /proc the hung Xvfb is killed.
+#[test]
+fn stopped_xvfb_does_not_hang_up_or_down() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-stop-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    cli.ok(&["--size", "320x240", "up"]);
+    let pid = cli.pid().unwrap();
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let t0 = Instant::now();
+    let up = cli.ok(&["up"]);
+    assert!(t0.elapsed() < Duration::from_secs(10), "up took {:?}", t0.elapsed());
+    assert!(up.contains("started Xvfb"), "{up}");
+    assert!(wait_until(Duration::from_secs(3), || !alive(pid)), "hung Xvfb left behind");
+    let pid = cli.pid().unwrap();
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let t0 = Instant::now();
+    let down = cli.ok(&["down"]);
+    assert!(t0.elapsed() < Duration::from_secs(8), "down took {:?}", t0.elapsed());
+    assert!(down.contains("stopped Xvfb"), "{down}");
+    assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed non-input request does not wait behind a running hold_key.
+#[test]
+fn failed_read_does_not_wait_for_input() {
+    let Some(x) = xvfb("busy") else { return };
+    let b = std::sync::Arc::new(backend(&x, false));
+    let b2 = b.clone();
+    let hold = std::thread::spawn(move || b2.call(&Request::KeyHold { keys: vec!["shift".into()], seconds: 3.0 }));
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    assert!(b.call(&Request::RecordStop).is_err(), "record_stop without a recording");
+    assert!(t0.elapsed() < Duration::from_millis(1000), "waited {:?} behind the hold", t0.elapsed());
+    hold.join().unwrap().unwrap();
 }
