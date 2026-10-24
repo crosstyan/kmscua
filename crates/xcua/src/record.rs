@@ -11,11 +11,20 @@
 //!
 //! Disk: a 1920x1080 desktop at JPEG quality [`QUALITY`] is roughly
 //! 100-300 KB a still, so a screen that changes on every tick at 5 fps
-//! writes about 1 MB/s and the 600 s default cap bounds a recording near
-//! 600 MB. An agent session, idle between actions, writes a small fraction
-//! of that.
-
-// main.rs wires this in once the X11 backend lands.
+//! writes about 1 MB/s. "Idle" is rarely idle: a blinking caret changes the
+//! picture about once a second (measured: 23 stills in 20 s with a
+//! terminal focused and nothing typed). Three limits keep a recording from
+//! filling the disk of a sandbox whose only persistent directory is small,
+//! each ending it with `error` set and the stills so far intact:
+//!
+//! - a byte budget, [`DEFAULT_MAX_MB`] unless `XCUA_RECORD_MAX_MB` or the
+//!   options say otherwise;
+//! - a free-space floor, [`MIN_FREE_MB`] on the recordings' filesystem;
+//! - the first ENOSPC or EDQUOT, which is not retried.
+//!
+//! The closing still is a hard link, so it costs no space. `record_start`
+//! keeps only the newest [`KEEP`] recordings in the directory (stills,
+//! manifest and timeline), and removes half-written `.tmp` files.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -39,6 +48,11 @@ pub struct RecordOpts {
     pub max_side: Option<u32>,
     pub max_seconds: Option<u32>,
     pub cursor: Option<bool>,
+    /// Byte budget for the stills; None = `XCUA_RECORD_MAX_MB` or
+    /// [`DEFAULT_MAX_MB`].
+    pub max_bytes: Option<u64>,
+    /// Stop when the filesystem has less free than this; None = [`MIN_FREE_MB`].
+    pub min_free_bytes: Option<u64>,
 }
 
 /// Capture rate when the request names none. Lower than the MP4 recorder's
@@ -54,6 +68,23 @@ pub const QUALITY: u8 = 75;
 /// still written is the same picture, and is not written.
 const SAME: u8 = 4;
 pub const CODEC: &str = "jpeg-stills";
+/// Byte budget of one recording when nothing says otherwise.
+pub const DEFAULT_MAX_MB: u64 = 200;
+/// A recording stops when its filesystem has less free space than this.
+pub const MIN_FREE_MB: u64 = 64;
+/// Recordings kept in the directory, the one being started included.
+pub const KEEP: usize = 5;
+const MB: u64 = 1024 * 1024;
+
+/// The byte budget from `XCUA_RECORD_MAX_MB`, else the default.
+fn default_max_bytes() -> u64 {
+    std::env::var("XCUA_RECORD_MAX_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(DEFAULT_MAX_MB)
+        * MB
+}
 
 /// What the thread updates and `info` reads.
 #[derive(Default)]
@@ -87,8 +118,22 @@ impl Recorder {
             _ => format!("rec-{}", unix_time()),
         };
         let path = dir.join(format!("{base}.frames"));
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        prune(dir, &path, KEEP);
         std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
         clear_stills(&path)?;
+        let max_bytes = opts.max_bytes.unwrap_or_else(default_max_bytes);
+        let min_free = opts.min_free_bytes.unwrap_or(MIN_FREE_MB * MB);
+        if let Some(free) = free_bytes(&path) {
+            if free < min_free {
+                anyhow::bail!(
+                    "not recording: {} MB free on the recordings' filesystem ({}), under the {} MB floor",
+                    free / MB,
+                    dir.display(),
+                    min_free / MB
+                );
+            }
+        }
         let fps = opts.fps.unwrap_or(DEFAULT_FPS).clamp(1, 30);
         let max_side = opts.max_side.unwrap_or(DEFAULT_MAX_SIDE);
         let limit = Duration::from_secs(opts.max_seconds.unwrap_or(DEFAULT_MAX_SECONDS).clamp(1, 6 * 3600) as u64);
@@ -101,7 +146,7 @@ impl Recorder {
         let factor = plan_factor(first.width(), first.height(), max_side);
         let first = downscale_box(&first, factor);
         let (width, height) = first.dimensions();
-        write_still(&path, 0, &first)?;
+        let first_bytes = write_still(&path, 0, &first)?;
 
         let shared = Arc::new(Mutex::new(Shared { recording: true, frames: 1, ..Default::default() }));
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -116,6 +161,10 @@ impl Recorder {
             started,
             last: first,
             last_ms: 0,
+            bytes: first_bytes,
+            max_bytes,
+            min_free,
+            stop_reason: None,
             shared: shared.clone(),
         };
         let thread = std::thread::Builder::new()
@@ -187,6 +236,12 @@ struct Loop {
     /// The last still written, as written (before JPEG).
     last: RgbaImage,
     last_ms: u64,
+    /// Bytes of stills written so far, against `max_bytes`.
+    bytes: u64,
+    max_bytes: u64,
+    min_free: u64,
+    /// Why the recording ended early (budget, floor, disk full).
+    stop_reason: Option<String>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -206,6 +261,9 @@ impl Loop {
             }
             next += self.period;
             self.tick(at);
+            if self.stop_reason.is_some() {
+                break;
+            }
             // Ticks that went by while this one ran are dropped, not burst.
             let now = Instant::now();
             if now > next + self.period {
@@ -230,12 +288,40 @@ impl Loop {
         if same(&img, &self.last) {
             return;
         }
+        if let Some(free) = free_bytes(&self.path) {
+            if free < self.min_free {
+                self.stop_reason = Some(format!(
+                    "stopped: {} MB free on the recordings' filesystem, under the {} MB floor",
+                    free / MB,
+                    self.min_free / MB
+                ));
+                return;
+            }
+        }
+        let jpeg = match encode(&img) {
+            Ok(b) => b,
+            Err(e) => {
+                self.shared.lock().unwrap().error = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        if self.bytes + jpeg.len() as u64 > self.max_bytes {
+            self.stop_reason = Some(format!(
+                "stopped: the recording reached its {} MB budget (XCUA_RECORD_MAX_MB)",
+                self.max_bytes / MB
+            ));
+            return;
+        }
         let ms = at.as_millis() as u64;
-        match write_still(&self.path, ms, &img) {
+        match put_still(&self.path, ms, &jpeg) {
             Ok(()) => {
+                self.bytes += jpeg.len() as u64;
                 self.last = img;
                 self.last_ms = ms;
                 self.shared.lock().unwrap().frames += 1;
+            }
+            Err(e) if is_disk_full(&e) => {
+                self.stop_reason = Some(format!("stopped: disk full writing a still ({e})"));
             }
             Err(e) => self.shared.lock().unwrap().error = Some(format!("{e:#}")),
         }
@@ -249,14 +335,18 @@ impl Loop {
         let mut wrote = false;
         let mut err = None;
         if end_ms > self.last_ms {
-            match copy_still(&self.path, self.last_ms, end_ms) {
+            match link_still(&self.path, self.last_ms, end_ms) {
                 Ok(()) => wrote = true,
                 Err(e) => err = Some(format!("{e:#}")),
             }
         }
         let mut s = self.shared.lock().unwrap();
         s.frames += wrote as u64;
-        if err.is_some() {
+        // Why it stopped matters more than a failed closing still.
+        if let Some(reason) = self.stop_reason {
+            log::warn!("recording {}: {reason}", self.path.display());
+            s.error = Some(reason);
+        } else if err.is_some() {
             s.error = err;
         }
         s.seconds = end.as_secs_f32();
@@ -270,39 +360,112 @@ fn still_name(ms: u64) -> String {
     format!("{ms:08}.jpg")
 }
 
-/// Encode to a hidden temp file in the same directory, then rename, so a
-/// reader never sees half a JPEG.
-fn write_still(dir: &Path, ms: u64, img: &RgbaImage) -> Result<()> {
+fn encode(img: &RgbaImage) -> Result<Vec<u8>> {
     let rgb = image::DynamicImage::ImageRgba8(img.clone()).into_rgb8();
     let mut buf = Vec::with_capacity(256 * 1024);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, QUALITY)
         .encode_image(&rgb)
         .context("encode JPEG")?;
-    let name = still_name(ms);
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, &buf).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, dir.join(&name)).with_context(|| format!("rename {}", tmp.display()))
+    Ok(buf)
 }
 
-fn copy_still(dir: &Path, from_ms: u64, to_ms: u64) -> Result<()> {
-    let name = still_name(to_ms);
+/// Encode and write; answers the bytes written.
+fn write_still(dir: &Path, ms: u64, img: &RgbaImage) -> Result<u64> {
+    let jpeg = encode(img)?;
+    put_still(dir, ms, &jpeg).with_context(|| format!("write still {} in {}", still_name(ms), dir.display()))?;
+    Ok(jpeg.len() as u64)
+}
+
+/// Write to a hidden temp file in the same directory, then rename, so a
+/// reader never sees half a JPEG. The temp file goes on failure.
+fn put_still(dir: &Path, ms: u64, jpeg: &[u8]) -> std::io::Result<()> {
+    let name = still_name(ms);
     let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::copy(dir.join(still_name(from_ms)), &tmp).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, dir.join(&name)).with_context(|| format!("rename {}", tmp.display()))
+    let r = std::fs::write(&tmp, jpeg).and_then(|_| std::fs::rename(&tmp, dir.join(&name)));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// The closing still: a hard link to the last one (no bytes), a copy where
+/// the filesystem has no links.
+fn link_still(dir: &Path, from_ms: u64, to_ms: u64) -> Result<()> {
+    let (from, to) = (dir.join(still_name(from_ms)), dir.join(still_name(to_ms)));
+    if std::fs::hard_link(&from, &to).is_ok() {
+        return Ok(());
+    }
+    let tmp = dir.join(format!(".{}.tmp", still_name(to_ms)));
+    let r = std::fs::copy(&from, &tmp).and_then(|_| std::fs::rename(&tmp, &to));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.with_context(|| format!("write {}", to.display()))
+}
+
+fn is_disk_full(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+}
+
+/// Free bytes for an unprivileged writer on `path`'s filesystem.
+fn free_bytes(path: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
 /// Remove the stills of an earlier recording under the same name, as an
-/// MP4 of the same name is overwritten.
+/// MP4 of the same name is overwritten, and any half-written temp file.
 fn clear_stills(dir: &Path) -> Result<()> {
     for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let p = e?.path();
-        let ours = p.extension().and_then(|e| e.to_str()) == Some("jpg")
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let still = p.extension().and_then(|e| e.to_str()) == Some("jpg")
             && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()));
-        if ours {
+        let tmp = name.starts_with('.') && name.ends_with(".tmp");
+        if still || tmp {
             std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
         }
     }
     Ok(())
+}
+
+/// Keep the newest `keep - 1` recordings in `dir` besides `new` (which is
+/// about to be written): older `<name>.frames` directories go with their
+/// `<name>.json` manifest and `<name>.timeline.jsonl`. Temp files left in
+/// the kept ones by a crash go too. Best effort: failures are logged.
+fn prune(dir: &Path, new: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut recs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.extension().is_some_and(|x| x == "frames") && p != new)
+        .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
+        .collect();
+    recs.sort_by_key(|r| std::cmp::Reverse(r.0));
+    for (i, (_, rec)) in recs.iter().enumerate() {
+        if i + 1 < keep {
+            if let Ok(files) = std::fs::read_dir(rec) {
+                for f in files.flatten() {
+                    let n = f.file_name();
+                    let n = n.to_string_lossy();
+                    if n.starts_with('.') && n.ends_with(".tmp") {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+            continue;
+        }
+        log::info!("pruning old recording {}", rec.display());
+        if let Err(e) = std::fs::remove_dir_all(rec) {
+            log::warn!("prune {}: {e}", rec.display());
+        }
+        let _ = std::fs::remove_file(rec.with_extension("json"));
+        let _ = std::fs::remove_file(rec.with_extension("timeline.jsonl"));
+    }
 }
 
 fn same(a: &RgbaImage, b: &RgbaImage) -> bool {
@@ -525,6 +688,98 @@ mod tests {
         let broken: Grab = Box::new(|_| anyhow::bail!("no display"));
         assert!(Recorder::start(&dir, RecordOpts::default(), broken).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn byte_budget_ends_the_recording_with_an_error() {
+        let dir = tmp("budget");
+        let calls = Arc::new(AtomicU32::new(0));
+        // Noise, so every still is a sizeable JPEG and every tick a change.
+        let grab: Grab = Box::new(move |_| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RgbaImage::from_fn(128, 128, |x, y| {
+                let v = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503) ^ n.wrapping_mul(97)) as u8;
+                image::Rgba([v, v.rotate_left(3), v.rotate_left(5), 255])
+            }))
+        });
+        let opts = RecordOpts { name: Some("b".into()), fps: Some(30), max_bytes: Some(40 * 1024), ..Default::default() };
+        let mut rec = Recorder::start(&dir, opts, grab).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        let info = rec.info();
+        assert!(!info.recording, "still recording past its budget");
+        assert!(info.error.as_deref().is_some_and(|e| e.contains("budget")), "{:?}", info.error);
+        assert_eq!(info.finalized, Some(true));
+        // Distinct files only: the closing still is a hard link.
+        let mut seen = std::collections::HashSet::new();
+        let bytes: u64 = std::fs::read_dir(dir.join("b.frames"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap())
+            .filter(|m| seen.insert(std::os::unix::fs::MetadataExt::ino(m)))
+            .map(|m| m.len())
+            .sum();
+        assert!(bytes > 0 && bytes <= 40 * 1024, "{bytes} bytes against a 40 KB budget");
+        // No temp file left behind.
+        assert!(stills(&dir.join("b.frames")).iter().all(|n| !n.ends_with(".tmp")));
+        rec.stop();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn free_space_floor_refuses_to_start() {
+        let dir = tmp("floor");
+        let grab = fake(16, 16, Arc::new(AtomicU32::new(0)), |_| 7);
+        let opts = RecordOpts { name: Some("f".into()), min_free_bytes: Some(u64::MAX), ..Default::default() };
+        let e = Recorder::start(&dir, opts, grab).err().expect("started under the floor");
+        assert!(format!("{e:#}").contains("floor"), "{e:#}");
+        assert!(free_bytes(&dir).is_some_and(|f| f > 0));
+        assert!(is_disk_full(&std::io::Error::from_raw_os_error(libc::ENOSPC)));
+        assert!(is_disk_full(&std::io::Error::from_raw_os_error(libc::EDQUOT)));
+        assert!(!is_disk_full(&std::io::Error::from_raw_os_error(libc::EACCES)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn start_keeps_the_newest_recordings_and_drops_temp_files() {
+        let dir = tmp("prune");
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for i in 0..7 {
+            let rec = dir.join(format!("r{i}.frames"));
+            std::fs::create_dir_all(&rec).unwrap();
+            std::fs::write(rec.join("00000000.jpg"), b"x").unwrap();
+            std::fs::write(rec.join(".00000100.jpg.tmp"), b"half").unwrap();
+            std::fs::write(dir.join(format!("r{i}.json")), b"{}").unwrap();
+            std::fs::write(dir.join(format!("r{i}.timeline.jsonl")), b"").unwrap();
+            // r0 oldest, r6 newest.
+            let t = old + Duration::from_secs(60 * i);
+            set_mtime(&rec, t);
+        }
+        let new = dir.join("new.frames");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join(".00000005.jpg.tmp"), b"half").unwrap();
+        let grab = fake(16, 16, Arc::new(AtomicU32::new(0)), |_| 7);
+        let mut rec = Recorder::start(&dir, RecordOpts { name: Some("new".into()), ..Default::default() }, grab).unwrap();
+        rec.stop();
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".frames"))
+            .collect();
+        left.sort();
+        assert_eq!(left, ["new.frames", "r3.frames", "r4.frames", "r5.frames", "r6.frames"]);
+        assert!(!dir.join("r2.json").exists() && !dir.join("r2.timeline.jsonl").exists());
+        assert!(dir.join("r3.json").exists());
+        assert!(!dir.join("r6.frames/.00000100.jpg.tmp").exists());
+        assert!(stills(&new).iter().all(|n| !n.ends_with(".tmp")), "{:?}", stills(&new));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn set_mtime(p: &Path, t: std::time::SystemTime) {
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+        let ts = [libc::timespec { tv_sec: secs, tv_nsec: 0 }, libc::timespec { tv_sec: secs, tv_nsec: 0 }];
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0) }, 0);
     }
 
     #[test]
