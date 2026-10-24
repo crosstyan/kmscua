@@ -20,11 +20,15 @@
 //! - a byte budget, [`DEFAULT_MAX_MB`] unless `XCUA_RECORD_MAX_MB` or the
 //!   options say otherwise;
 //! - a free-space floor, [`MIN_FREE_MB`] on the recordings' filesystem;
-//! - the first ENOSPC or EDQUOT, which is not retried.
+//! - the first ENOSPC or EDQUOT, which is not retried; ENOENT too (the
+//!   directory was removed under the recorder).
 //!
 //! The closing still is a hard link, so it costs no space. `record_start`
 //! keeps only the newest [`KEEP`] recordings in the directory (stills,
-//! manifest and timeline), and removes half-written `.tmp` files.
+//! manifest and timeline), and removes half-written `.tmp` files. A
+//! recording in progress holds an `flock` on `<name>.frames/.active`; the
+//! pruning of another `xcua mcp` sharing the directory skips it, and a
+//! second recording under the same name is refused.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -121,6 +125,7 @@ impl Recorder {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         prune(dir, &path, KEEP);
         std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+        let active = hold_active(&path)?;
         clear_stills(&path)?;
         let max_bytes = opts.max_bytes.unwrap_or_else(default_max_bytes);
         let min_free = opts.min_free_bytes.unwrap_or(MIN_FREE_MB * MB);
@@ -165,6 +170,7 @@ impl Recorder {
             max_bytes,
             min_free,
             stop_reason: None,
+            active,
             shared: shared.clone(),
         };
         let thread = std::thread::Builder::new()
@@ -242,6 +248,8 @@ struct Loop {
     min_free: u64,
     /// Why the recording ended early (budget, floor, disk full).
     stop_reason: Option<String>,
+    /// The flocked `.active` file, released and removed at the end.
+    active: std::fs::File,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -323,6 +331,9 @@ impl Loop {
             Err(e) if is_disk_full(&e) => {
                 self.stop_reason = Some(format!("stopped: disk full writing a still ({e})"));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.stop_reason = Some(format!("stopped: the recording's directory is gone ({e})"));
+            }
             Err(e) => self.shared.lock().unwrap().error = Some(format!("{e:#}")),
         }
     }
@@ -340,6 +351,8 @@ impl Loop {
                 Err(e) => err = Some(format!("{e:#}")),
             }
         }
+        let _ = std::fs::remove_file(self.path.join(ACTIVE));
+        drop(self.active);
         let mut s = self.shared.lock().unwrap();
         s.frames += wrote as u64;
         // Why it stopped matters more than a failed closing still.
@@ -403,6 +416,41 @@ fn link_still(dir: &Path, from_ms: u64, to_ms: u64) -> Result<()> {
     r.with_context(|| format!("write {}", to.display()))
 }
 
+/// The file a recording in progress holds an `flock` on.
+const ACTIVE: &str = ".active";
+
+/// Lock `<rec>/.active` for the life of the recording; refuse when another
+/// recorder holds it.
+fn hold_active(rec: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let p = rec.join(ACTIVE);
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&p)
+        .with_context(|| format!("create {}", p.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!("{} is being recorded by another xcua; pick another name", rec.display());
+        }
+        // No flock on this filesystem: record anyway, unprotected.
+        log::info!("no flock for {}: {e}", p.display());
+    }
+    Ok(f)
+}
+
+/// Whether another process is recording into `rec` right now.
+fn is_active(rec: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(rec.join(ACTIVE)) else { return false };
+    let busy = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
+    // Closing the file drops the probe's lock, if it got one.
+    busy
+}
+
 fn is_disk_full(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
 }
@@ -443,6 +491,13 @@ fn prune(dir: &Path, new: &Path, keep: usize) {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir() && p.extension().is_some_and(|x| x == "frames") && p != new)
+        .filter(|p| {
+            let busy = is_active(p);
+            if busy {
+                log::info!("not pruning {}: another xcua is recording into it", p.display());
+            }
+            !busy
+        })
         .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
         .collect();
     recs.sort_by_key(|r| std::cmp::Reverse(r.0));
@@ -772,6 +827,56 @@ mod tests {
         assert!(dir.join("r3.json").exists());
         assert!(!dir.join("r6.frames/.00000100.jpg.tmp").exists());
         assert!(stills(&new).iter().all(|n| !n.ends_with(".tmp")), "{:?}", stills(&new));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_and_a_second_start_spare_an_active_recording() {
+        let dir = tmp("active");
+        // A static picture: after the first still nothing touches the dir,
+        // so an old mtime set here sticks.
+        let grab = fake(16, 16, Arc::new(AtomicU32::new(0)), |_| 7);
+        let mut live = Recorder::start(&dir, RecordOpts { name: Some("live".into()), fps: Some(20), ..Default::default() }, grab).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        set_mtime(&dir.join("live.frames"), old);
+        for i in 0..3 {
+            std::fs::create_dir_all(dir.join(format!("d{i}.frames"))).unwrap();
+            set_mtime(&dir.join(format!("d{i}.frames")), old + Duration::from_secs(60 * (i + 1)));
+        }
+        prune(&dir, &dir.join("next.frames"), 2);
+        assert!(dir.join("live.frames/00000000.jpg").exists(), "pruned an active recording");
+        assert!(dir.join("d2.frames").exists() && !dir.join("d1.frames").exists() && !dir.join("d0.frames").exists());
+        // Same name while it records: refused, and its stills untouched.
+        let grab = fake(16, 16, Arc::new(AtomicU32::new(0)), |_| 9);
+        let e = Recorder::start(&dir, RecordOpts { name: Some("live".into()), ..Default::default() }, grab).err().expect("second recorder on one name");
+        assert!(format!("{e:#}").contains("another xcua"), "{e:#}");
+        assert!(dir.join("live.frames/00000000.jpg").exists());
+        let info = live.stop();
+        assert!(info.error.is_none(), "{:?}", info.error);
+        assert!(!dir.join("live.frames/.active").exists());
+        // Stopped: prunable again.
+        prune(&dir, &dir.join("next.frames"), 1);
+        assert!(!dir.join("live.frames").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removed_directory_ends_the_recording() {
+        let dir = tmp("gone");
+        let calls = Arc::new(AtomicU32::new(0));
+        let grab = fake(16, 16, calls, |n| (n * 40 % 250) as u8);
+        let mut rec = Recorder::start(&dir, RecordOpts { name: Some("g".into()), fps: Some(20), ..Default::default() }, grab).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::remove_dir_all(dir.join("g.frames")).unwrap();
+        assert!(
+            (0..40).any(|_| {
+                std::thread::sleep(Duration::from_millis(50));
+                !rec.info().recording
+            }),
+            "still recording into a removed directory"
+        );
+        let info = rec.stop();
+        assert!(info.error.as_deref().is_some_and(|e| e.contains("gone")), "{:?}", info.error);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
