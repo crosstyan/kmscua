@@ -1,0 +1,23 @@
+[package]
+name = "xcua"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kmscua's tools over X11: one unprivileged process that owns an Xvfb, captures it and drives it, for sandboxes with no DRM or uinput"
+
+[[bin]]
+name = "xcua"
+path = "src/main.rs"
+
+[dependencies]
+kmscua_mcp = { package = "cua", path = "../cua", default-features = false }
+kmscua-proto = { path = "../proto" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+x11rb = { version = "0.13", features = ["xtest", "xfixes", "shm", "randr"] }
