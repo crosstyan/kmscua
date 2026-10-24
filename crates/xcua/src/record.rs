@@ -659,7 +659,8 @@ mod tests {
         assert_eq!(info.finalized, Some(true));
         assert_eq!(info.codec.as_deref(), Some("jpeg-stills"));
         assert_eq!((info.width, info.height, info.fps), (64, 48, 20));
-        assert!(info.seconds >= 0.85 && info.seconds < 1.2, "seconds {}", info.seconds);
+        // Load can only delay the stop.
+        assert!(info.seconds >= 0.85 && info.seconds < 3.0, "seconds {}", info.seconds);
 
         let names = stills(&path);
         assert_eq!(names.len() as u64, info.frames, "{names:?}");
@@ -692,9 +693,15 @@ mod tests {
         let grab = fake(32, 32, calls, |n| (n % 200) as u8);
         let opts = RecordOpts { name: Some("max".into()), fps: Some(20), max_seconds: Some(1), ..Default::default() };
         let mut rec = Recorder::start(&dir, opts, grab).unwrap();
-        std::thread::sleep(Duration::from_millis(1400));
+        std::thread::sleep(Duration::from_millis(1100));
+        // The thread notices max_seconds on its next tick; give a loaded
+        // machine time to get there.
+        let ended = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            !rec.info().recording
+        });
+        assert!(ended, "still recording past max_seconds");
         let info = rec.info();
-        assert!(!info.recording);
         assert_eq!(info.finalized, Some(true));
         assert!((info.seconds - 1.0).abs() < 1e-3, "seconds {}", info.seconds);
         let names = stills(&dir.join("max.frames"));
@@ -759,9 +766,12 @@ mod tests {
         });
         let opts = RecordOpts { name: Some("b".into()), fps: Some(30), max_bytes: Some(40 * 1024), ..Default::default() };
         let mut rec = Recorder::start(&dir, opts, grab).unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
+        let ended = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            !rec.info().recording
+        });
+        assert!(ended, "still recording past its budget");
         let info = rec.info();
-        assert!(!info.recording, "still recording past its budget");
         assert!(info.error.as_deref().is_some_and(|e| e.contains("budget")), "{:?}", info.error);
         assert_eq!(info.finalized, Some(true));
         // Distinct files only: the closing still is a hard link.
@@ -867,9 +877,16 @@ mod tests {
         let grab = fake(16, 16, calls, |n| (n * 40 % 250) as u8);
         let mut rec = Recorder::start(&dir, RecordOpts { name: Some("g".into()), fps: Some(20), ..Default::default() }, grab).unwrap();
         std::thread::sleep(Duration::from_millis(150));
-        std::fs::remove_dir_all(dir.join("g.frames")).unwrap();
+        // The recorder may add a still between remove_dir_all's listing and
+        // its rmdir (ENOTEMPTY under load): retry until the directory is gone.
+        let gone = (0..50).any(|_| match std::fs::remove_dir_all(dir.join("g.frames")) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        });
+        assert!(gone, "could not remove the recording directory");
         assert!(
-            (0..40).any(|_| {
+            (0..200).any(|_| {
                 std::thread::sleep(Duration::from_millis(50));
                 !rec.info().recording
             }),

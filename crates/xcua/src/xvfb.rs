@@ -30,9 +30,13 @@
 //! network namespace), where the pid may name another process.
 //!
 //! Every probe of a display has a 2 s deadline, so a stopped (SIGSTOP) or
-//! wedged Xvfb cannot hang `up`, `down` or an exiting `mcp`. With `/proc`,
-//! an Xvfb that is xcua's (pid and start time) but does not answer is
-//! killed before a new one is started.
+//! wedged Xvfb cannot hang `up`, `down` or an exiting `mcp`. Deciding that
+//! xcua's Xvfb is unresponsive takes repeated probes over 10 s, since a busy
+//! sandbox (a software-rendered browser, 4K grabs) can miss one. If it
+//! never answers, `up` (and an `mcp`'s re-up) kills it and starts a new one
+//! only when `/proc` shows it stopped (state T); a running but silent Xvfb
+//! is left alone and `up` fails with a message, so a slow moment never
+//! costs the agent its session.
 //! - `xvfb.log`: the Xvfb's stderr. `recordings/`: stills recordings.
 //!
 //! Which display a command uses: `--display :N` when given (`--display
@@ -58,12 +62,27 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::x11::Probe;
+
 /// How long an Xvfb gets to report its display and answer.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a display gets to answer a probe.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a command waits for another xcua to let go of the state dir.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long xcua's own Xvfb may stay silent before `up` acts on it.
+const PATIENCE: Duration = Duration::from_secs(10);
+
+/// What the state dir's Xvfb is doing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// Answers, with xcua's nonce.
+    Live(String, Proc),
+    /// Accepts connections but never answered within the patience.
+    Silent(String, Proc),
+    /// Not there (or another server sits on its number).
+    Gone,
+}
 
 /// Where xcua keeps its notes.
 #[derive(Clone, Debug)]
@@ -381,15 +400,29 @@ impl State {
         let _ = fs::remove_dir_all(self.users_dir());
     }
 
-    /// xcua's own Xvfb, if its display answers with xcua's nonce. Without a
-    /// recorded nonce (state from an older xcua), by pid and start time.
+    /// xcua's own Xvfb, if its display answers with xcua's nonce, probing
+    /// for up to 10 s before calling it silent.
     pub fn live(&self) -> Option<(String, Proc)> {
-        let (display, pid) = (self.display()?, self.pid()?);
-        let ours = match self.nonce() {
-            Some(n) => nonce_of(&display).as_deref() == Some(n.as_str()),
-            None => pid.is_xvfb() && answers(&display),
-        };
-        ours.then_some((display, pid))
+        match self.check(PATIENCE) {
+            Liveness::Live(d, p) => Some((d, p)),
+            _ => None,
+        }
+    }
+
+    /// Probe xcua's Xvfb until it answers, is gone, or `patience` runs out.
+    /// Without a recorded nonce (state from an older xcua), the pid and
+    /// start time stand in for it.
+    pub fn check(&self, patience: Duration) -> Liveness {
+        let (Some(display), Some(pid)) = (self.display(), self.pid()) else { return Liveness::Gone };
+        let nonce = self.nonce();
+        if nonce.is_none() && !pid.is_xvfb() {
+            return Liveness::Gone;
+        }
+        match probe_patiently(&display, patience) {
+            Probe::Answered(n) if nonce.is_none() || n == nonce => Liveness::Live(display, pid),
+            Probe::Answered(_) | Probe::Absent => Liveness::Gone,
+            Probe::Silent => Liveness::Silent(display, pid),
+        }
     }
 
     /// A display recorded by `up --display` (no pidfile) that answers.
@@ -466,6 +499,27 @@ fn remove(path: &Path) {
 /// within 2 s, so a stopped server counts as not answering.
 pub fn answers(display: &str) -> bool {
     !display.is_empty() && crate::x11::connect_within(display, ANSWER_TIMEOUT).is_ok()
+}
+
+/// Probe `display` until it answers or is gone, for at most `patience`.
+fn probe_patiently(display: &str, patience: Duration) -> Probe {
+    let end = Instant::now() + patience;
+    loop {
+        let p = crate::x11::probe(display, ANSWER_TIMEOUT);
+        if p != Probe::Silent || Instant::now() >= end {
+            return p;
+        }
+        log::info!("{display} did not answer within {} s; probing again", ANSWER_TIMEOUT.as_secs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Whether `/proc` shows `pid` stopped (state T or t).
+fn stopped(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with(['T', 't'])))
+        .unwrap_or(false)
 }
 
 /// The `_XCUA_NONCE` on `display`'s root, within 2 s.
@@ -596,6 +650,11 @@ pub fn explicit(display: Option<&str>) -> Result<Option<String>> {
             .filter(|d| !d.is_empty())
             .map(Some)
             .ok_or_else(|| anyhow!("--display env, but $DISPLAY is not set")),
+        // x11rb 0.13 maps a socket-path display ("launchd mode") to
+        // /tmp/.X11-unix/X0, which would be the user's own display.
+        Some(d) if d.starts_with('/') || d.starts_with("unix:") => {
+            bail!("--display {d}: socket paths are not supported; use :N")
+        }
         Some(d) => Ok(Some(d.to_string())),
     }
 }
@@ -607,15 +666,14 @@ pub fn explicit(display: Option<&str>) -> Result<Option<String>> {
 pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) -> Result<Up> {
     let _lock = state.lock()?;
     if let Some(d) = display {
-        if let Some((own, p)) = state.live() {
-            if own == d {
-                return reuse(state, owner, own, p);
-            }
-            bail!(
+        match state.check(PATIENCE) {
+            Liveness::Live(own, p) if own == d => return reuse(state, owner, own, p),
+            Liveness::Live(own, p) | Liveness::Silent(own, p) => bail!(
                 "xcua's own Xvfb {own} (pid {}) is running for {}; run `xcua down` first, or use --display without `up`",
                 p.pid,
                 state.dir.display()
-            );
+            ),
+            Liveness::Gone => {}
         }
         if !answers(d) {
             bail!("no X server answers on {d}");
@@ -624,17 +682,26 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
         state.write(d, None, None)?;
         return Ok(Up::Attached { display: d.to_string() });
     }
-    if let Some((d, p)) = state.live() {
-        return reuse(state, owner, d, p);
+    match state.check(PATIENCE) {
+        Liveness::Live(d, p) => return reuse(state, owner, d, p),
+        Liveness::Silent(d, p) => {
+            // Never on one missed probe, never on a running process: only a
+            // stopped Xvfb that /proc confirms is xcua's is replaced.
+            if have_proc() && p.is_xvfb() && stopped(p.pid) {
+                log::warn!("xcua's Xvfb on {d} (pid {}) is stopped and has not answered for {} s; killing it", p.pid, PATIENCE.as_secs());
+                stop(&p, None, None);
+            } else {
+                bail!(
+                    "xcua's Xvfb on {d} (pid {}) has not answered for {} s but is not stopped (busy?); not starting a second one. Retry, or `xcua down` to replace it",
+                    p.pid,
+                    PATIENCE.as_secs()
+                );
+            }
+        }
+        Liveness::Gone => {}
     }
     if let Some(d) = state.attached() {
         return Ok(Up::Attached { display: d });
-    }
-    // xcua's Xvfb by pid and start time, but not answering: stopped or
-    // wedged. Kill it rather than leave it behind.
-    if let Some(p) = state.pid().filter(|p| p.is_xvfb()) {
-        log::warn!("xcua's Xvfb (pid {}) does not answer; killing it", p.pid);
-        stop(&p, None, None);
     }
     // Whatever the state dir said is stale now.
     state.clear();
@@ -791,7 +858,12 @@ pub fn status(state: &State) -> String {
             s.push_str(&format!(
                 "xvfb pid: {} ({}), owner: {}{}, mcp users: {}\n",
                 p.pid,
-                if p.is_xvfb() || (!have_proc() && state.live().is_some()) { "alive" } else { "gone" },
+                match state.check(ANSWER_TIMEOUT) {
+                    Liveness::Live(..) => "answering",
+                    Liveness::Silent(..) => "not answering",
+                    Liveness::Gone if p.is_xvfb() => "running, display gone",
+                    Liveness::Gone => "gone",
+                },
                 owner.map(|o| o.as_line()).unwrap_or_else(|| "?".into()),
                 if orphan { " (dead; the next `xcua up` or `mcp` adopts it)" } else { "" },
                 if users.is_empty() { "none".to_string() } else { format!("{users:?}") }
@@ -907,6 +979,40 @@ mod tests {
         // A holder that is not alive (start time cannot match): broken.
         fs::write(st.dir.join("lock.excl"), format!("{} 1\n", std::process::id())).unwrap();
         drop(st.lock_excl(Instant::now()).unwrap());
+        fs::remove_dir_all(&st.dir).unwrap();
+    }
+
+    /// A socket that accepts and never answers is silent, not gone, for as
+    /// long as the patience runs; a missing socket is gone at once. The fake
+    /// server is an abstract socket on a free high display number.
+    #[test]
+    fn silent_and_absent_servers_are_told_apart() {
+        use std::os::linux::net::SocketAddrExt;
+        let st = tmp_state("silent");
+        let free = |n: u32| !Path::new(&format!("/tmp/.X11-unix/X{n}")).exists();
+        let (n, _listener) = (5000 + std::process::id() % 3000..9000)
+            .filter(|&n| free(n))
+            .find_map(|n| {
+                let addr = std::os::unix::net::SocketAddr::from_abstract_name(format!("/tmp/.X11-unix/X{n}")).ok()?;
+                std::os::unix::net::UnixListener::bind_addr(&addr).ok().map(|l| (n, l))
+            })
+            .expect("a free display number");
+        let display = format!(":{n}");
+        let me = Proc::now(std::process::id()).unwrap();
+        st.write(&display, Some((me, "n")), Some(Owner::Up)).unwrap();
+        let t0 = Instant::now();
+        assert!(matches!(st.check(Duration::from_millis(2500)), Liveness::Silent(..)));
+        assert!(t0.elapsed() >= Duration::from_millis(2500), "gave up after {:?}", t0.elapsed());
+        // up never kills on silence it cannot prove is a stopped Xvfb of
+        // ours: here the pid is this test (running, not an Xvfb).
+        assert!(!stopped(std::process::id()));
+        let e = up(&st, None, (320, 240), Owner::Up).expect_err("up started a second server over a silent one");
+        assert!(format!("{e:#}").contains("not stopped"), "{e:#}");
+        drop(_listener);
+        let t0 = Instant::now();
+        assert_eq!(crate::x11::probe(&display, Duration::from_secs(2)), Probe::Absent);
+        assert!(t0.elapsed() < Duration::from_millis(500));
+        assert!(explicit(Some("/tmp/.X11-unix/X0")).is_err());
         fs::remove_dir_all(&st.dir).unwrap();
     }
 

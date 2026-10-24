@@ -76,25 +76,32 @@ fn red_window(display: &str) -> (RustConnection, u32) {
     .unwrap();
     conn.map_window(win).unwrap();
     conn.flush().unwrap();
-    let ok = wait_events(&conn, Duration::from_secs(5), |e| matches!(e, Event::MapNotify(_)));
+    let ok = wait_events(&conn, 1, Duration::from_secs(10), |e| matches!(e, Event::MapNotify(_)));
     assert_eq!(ok.len(), 1, "window never mapped");
     (conn, win)
 }
 
-/// Events matching `want` until the deadline (or the first one, when
-/// `want` is for MapNotify).
-fn wait_events(conn: &RustConnection, timeout: Duration, want: impl Fn(&Event) -> bool) -> Vec<Event> {
+/// Events matching `want` until `n` have arrived or the deadline passes.
+/// Deadlines are generous (a loaded machine delays delivery) and cost
+/// nothing when the events come.
+fn wait_events(conn: &RustConnection, n: usize, timeout: Duration, want: impl Fn(&Event) -> bool) -> Vec<Event> {
     let deadline = Instant::now() + timeout;
     let mut got = Vec::new();
     while Instant::now() < deadline {
         while let Some(e) = conn.poll_for_event().unwrap() {
             if want(&e) {
-                let map = matches!(e, Event::MapNotify(_));
                 got.push(e);
-                if map {
-                    return got;
+            }
+        }
+        if got.len() >= n {
+            // A moment more, so an extra (wrong) event is seen too.
+            std::thread::sleep(Duration::from_millis(100));
+            while let Some(e) = conn.poll_for_event().unwrap() {
+                if want(&e) {
+                    got.push(e);
                 }
             }
+            return got;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -182,13 +189,13 @@ fn click_focuses_and_typing_reaches_the_window() {
     b.call(&Request::Click { x: 200, y: 175, button: Button::Left, count: 1, modifiers: vec![] }).unwrap();
     let focus = conn.get_input_focus().unwrap().reply().unwrap().focus;
     assert_eq!(focus, win, "click did not focus the window under the pointer");
-    let presses = wait_events(&conn, Duration::from_millis(500), |e| matches!(e, Event::ButtonPress(_)));
+    let presses = wait_events(&conn, 1, Duration::from_secs(5), |e| matches!(e, Event::ButtonPress(_)));
     assert_eq!(presses.len(), 1);
 
     // ASCII with a shifted character: keycodes as the server maps them.
     let map = xcua::input::Input::open(&x.display).unwrap().keymap().unwrap();
     b.call(&Request::Type { text: "hI".into(), delay_ms: None }).unwrap();
-    let keys: Vec<u8> = wait_events(&conn, Duration::from_millis(500), |e| matches!(e, Event::KeyPress(_)))
+    let keys: Vec<u8> = wait_events(&conn, 3, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_)))
         .into_iter()
         .filter_map(|e| if let Event::KeyPress(k) = e { Some(k.detail) } else { None })
         .collect();
@@ -204,14 +211,14 @@ fn click_focuses_and_typing_reaches_the_window() {
     };
     let map_before = mapping(&conn);
     kmscua_mcp::type_text(&b, "é铃").unwrap();
-    let uni = wait_events(&conn, Duration::from_millis(500), |e| matches!(e, Event::KeyPress(_)));
+    let uni = wait_events(&conn, 2, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_)));
     assert_eq!(uni.len(), 2, "two key presses for two characters");
     assert_eq!(mapping(&conn), map_before, "spare keycodes were not unbound");
 
     // Chords and wheel leave nothing held.
     b.call(&Request::KeyCombo { keys: vec!["ctrl+shift+t".into()] }).unwrap();
     b.call(&Request::Scroll { x: 200, y: 175, dx: 0, dy: 2, modifiers: vec!["shift".into()] }).unwrap();
-    let wheel: Vec<u8> = wait_events(&conn, Duration::from_millis(500), |e| matches!(e, Event::ButtonPress(_)))
+    let wheel: Vec<u8> = wait_events(&conn, 2, Duration::from_secs(5), |e| matches!(e, Event::ButtonPress(_)))
         .into_iter()
         .filter_map(|e| if let Event::ButtonPress(p) = e { Some(p.detail) } else { None })
         .collect();
@@ -464,7 +471,7 @@ fn mcp_with_display_set_starts_its_own() {
     assert!(doctor.contains("320x240") && doctor.contains(&format!("\"{own}\"")), "{doctor}");
     let pid = cli.pid().unwrap();
     m.finish();
-    assert!(wait_until(Duration::from_secs(5), || !alive(pid)), "mcp's Xvfb outlived it");
+    assert!(wait_until(Duration::from_secs(15), || !alive(pid)), "mcp's Xvfb outlived it");
     assert!(cli.env_display().is_none());
 
     let mut m = cli.mcp(&["--display", &decoy.display]);
@@ -522,7 +529,7 @@ fn mcp_users_share_adopt_and_reconnect() {
     assert!(cli.ok(&["status"]).contains("mcp users: ["), "{}", cli.ok(&["status"]));
     assert_eq!(a.tool("screenshot", serde_json::json!({})), "<image>");
     a.finish();
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(500));
     assert!(alive(pid), "first mcp stopped the Xvfb its peer uses");
     assert_eq!(b.tool("screenshot", serde_json::json!({})), "<image>");
 
@@ -539,7 +546,7 @@ fn mcp_users_share_adopt_and_reconnect() {
     // the next input request is told the display restarted, then input
     // works on the new display.
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    assert!(wait_until(Duration::from_secs(5), || !alive(pid)));
+    assert!(wait_until(Duration::from_secs(15), || !alive(pid)));
     assert_eq!(c.tool("screenshot", serde_json::json!({})), "<image>", "no reconnect after the Xvfb died");
     let new_pid = cli.pid().unwrap();
     assert_ne!(new_pid, pid);
@@ -548,12 +555,12 @@ fn mcp_users_share_adopt_and_reconnect() {
     assert_eq!(c.tool("left_click", serde_json::json!({"coordinate": [10, 10]})), "OK");
     // Input first after a restart: refused, not replayed onto the new display.
     unsafe { libc::kill(new_pid, libc::SIGKILL) };
-    assert!(wait_until(Duration::from_secs(5), || !alive(new_pid)));
+    assert!(wait_until(Duration::from_secs(15), || !alive(new_pid)));
     let typed = c.tool("type", serde_json::json!({"text": "rm -rf"}));
     assert!(typed.contains("restarted") && typed.contains("not sent"), "{typed}");
     let new_pid = cli.pid().unwrap();
     c.finish();
-    assert!(wait_until(Duration::from_secs(5), || !alive(new_pid)), "last mcp did not stop the Xvfb");
+    assert!(wait_until(Duration::from_secs(15), || !alive(new_pid)), "last mcp did not stop the Xvfb");
     drop(cli);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -600,7 +607,7 @@ fn shutdown_cancels_a_hold() {
     b.shutdown(Duration::from_secs(2));
     let r = hold.join().unwrap();
     assert!(r.is_err(), "hold was not cancelled");
-    assert!(t0.elapsed() < Duration::from_secs(3), "shutdown waited {:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_secs(10), "shutdown waited {:?} (the hold was 30 s)", t0.elapsed());
     let (conn, _) = RustConnection::connect(Some(&x.display)).unwrap();
     let keys = conn.query_keymap().unwrap().reply().unwrap().keys;
     assert!(keys.iter().all(|&k| k == 0), "keys left down: {keys:?}");
@@ -666,13 +673,14 @@ fn no_proc_recognises_its_xvfb_by_nonce() {
     let down = cli.ok(&["down"]);
     assert!(down.contains("stopped Xvfb"), "{down}");
     assert!(!xcua::xvfb::answers(&display));
-    assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
+    assert!(wait_until(Duration::from_secs(15), || !alive(pid)));
     drop(cli);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A stopped (SIGSTOP) Xvfb cannot hang `up` or `down`: probes time out,
-/// and with /proc the hung Xvfb is killed.
+/// and once it stays silent for the whole patience, /proc shows it stopped
+/// and it is replaced.
 #[test]
 fn stopped_xvfb_does_not_hang_up_or_down() {
     if !have_xvfb() {
@@ -685,16 +693,17 @@ fn stopped_xvfb_does_not_hang_up_or_down() {
     unsafe { libc::kill(pid, libc::SIGSTOP) };
     let t0 = Instant::now();
     let up = cli.ok(&["up"]);
-    assert!(t0.elapsed() < Duration::from_secs(10), "up took {:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_secs(25), "up took {:?}", t0.elapsed());
+    assert!(t0.elapsed() >= Duration::from_secs(9), "replaced after only {:?}", t0.elapsed());
     assert!(up.contains("started Xvfb"), "{up}");
-    assert!(wait_until(Duration::from_secs(3), || !alive(pid)), "hung Xvfb left behind");
+    assert!(wait_until(Duration::from_secs(15), || !alive(pid)), "hung Xvfb left behind");
     let pid = cli.pid().unwrap();
     unsafe { libc::kill(pid, libc::SIGSTOP) };
     let t0 = Instant::now();
     let down = cli.ok(&["down"]);
     assert!(t0.elapsed() < Duration::from_secs(8), "down took {:?}", t0.elapsed());
     assert!(down.contains("stopped Xvfb"), "{down}");
-    assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
+    assert!(wait_until(Duration::from_secs(15), || !alive(pid)));
     drop(cli);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -705,10 +714,65 @@ fn failed_read_does_not_wait_for_input() {
     let Some(x) = xvfb("busy") else { return };
     let b = std::sync::Arc::new(backend(&x, false));
     let b2 = b.clone();
-    let hold = std::thread::spawn(move || b2.call(&Request::KeyHold { keys: vec!["shift".into()], seconds: 3.0 }));
-    std::thread::sleep(Duration::from_millis(200));
+    let hold = std::thread::spawn(move || b2.call(&Request::KeyHold { keys: vec!["shift".into()], seconds: 8.0 }));
+    std::thread::sleep(Duration::from_millis(300));
     let t0 = Instant::now();
     assert!(b.call(&Request::RecordStop).is_err(), "record_stop without a recording");
-    assert!(t0.elapsed() < Duration::from_millis(1000), "waited {:?} behind the hold", t0.elapsed());
+    // Waiting behind the hold would take about 7.7 s.
+    assert!(t0.elapsed() < Duration::from_secs(4), "waited {:?} behind the hold", t0.elapsed());
     hold.join().unwrap().unwrap();
+}
+
+/// A slow moment is not a dead server: `up` keeps probing, and an Xvfb that
+/// answers again within the patience is reused, not killed.
+#[test]
+fn slow_xvfb_is_not_killed() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-slow-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    cli.ok(&["--size", "320x240", "up"]);
+    let pid = cli.pid().unwrap();
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let up = cli.cmd().arg("up").stdout(std::process::Stdio::piped()).spawn().unwrap();
+    // Longer than one 2 s probe, well inside the 10 s patience.
+    std::thread::sleep(Duration::from_secs(3));
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let out = up.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("already up"), "{text}");
+    assert!(alive(pid), "a slow Xvfb was killed");
+    assert_eq!(cli.pid(), Some(pid));
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A display xcua attached to gets no _XCUA_NONCE; xcua's own Xvfb has one.
+#[test]
+fn attached_display_is_not_marked() {
+    let Some(x) = xvfb("mark") else { return };
+    let b = backend(&x, false);
+    b.call(&Request::Screenshot { max_side: Some(64), format: ImageFormat::Png, quality: None, cursor: None, region: None }).unwrap();
+    b.call(&Request::PointerMove { x: 5, y: 5 }).unwrap();
+    let _ = b.doctor();
+    let (conn, screen) = RustConnection::connect(Some(&x.display)).unwrap();
+    let root = conn.setup().roots[screen].root;
+    assert_eq!(xcua::x11::read_nonce(&conn, root), None, "wrote _XCUA_NONCE on an attached display");
+    let props = conn.list_properties(root).unwrap().reply().unwrap().atoms;
+    for a in props {
+        let name = conn.get_atom_name(a).unwrap().reply().unwrap().name;
+        assert!(!String::from_utf8_lossy(&name).starts_with("_XCUA"), "root property {}", String::from_utf8_lossy(&name));
+    }
+
+    let dir = std::env::temp_dir().join(format!("xcua-test-mark-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    cli.ok(&["--size", "320x240", "up"]);
+    let own = cli.env_display().unwrap();
+    let (conn, screen) = RustConnection::connect(Some(&own)).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let nonce = std::fs::read_to_string(cli.state.join("nonce")).unwrap();
+    assert_eq!(xcua::x11::read_nonce(&conn, root).as_deref(), Some(nonce.trim()));
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
 }

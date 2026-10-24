@@ -19,10 +19,10 @@
 //! is started. Only reads (screenshot, cursor, displays, status, ping) are
 //! retried. Input is never replayed: on a new server the windows it was
 //! aimed at are gone, so the request answers "the display was restarted"
-//! and nothing is sent. A server is told from a restarted one by the
-//! `_XCUA_NONCE` root property (see `x11::ensure_nonce`); when a retried
-//! read is what discovers the restart, the next input request carries the
-//! message instead.
+//! and nothing is sent. A server is told from a restarted one by a private
+//! atom interned at connect ([`x11::ServerToken`]), which writes nothing to
+//! the display; when a retried read is what discovers the restart, the
+//! next input request carries the message instead.
 
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -70,8 +70,8 @@ pub struct XBackend {
     /// Shared with every `Input`: raised at shutdown to cut holds short.
     cancel: Arc<AtomicBool>,
     reup: Option<Reup>,
-    /// `_XCUA_NONCE` of the server we are connected to.
-    identity: Mutex<Option<String>>,
+    /// Identity of the server we are connected to.
+    identity: Mutex<Option<x11::ServerToken>>,
     /// Set when a reconnect landed on a new server and no input request
     /// has been told yet.
     restarted: AtomicBool,
@@ -94,7 +94,7 @@ impl XBackend {
         let capture = Capture::open(display, shm)?;
         let input = Input::open(display)?;
         let cancel = input.canceller();
-        let identity = capture.nonce().map_err(|e| log::warn!("no server identity on {display}: {e:#}")).ok();
+        let identity = capture.server_token().map_err(|e| log::warn!("no server identity on {display}: {e:#}")).ok();
         Ok(Self {
             display: Mutex::new(display.to_string()),
             shm,
@@ -197,8 +197,8 @@ impl XBackend {
         let cap = Capture::open(&d, self.shm)?;
         let mut inp = Input::open(&d)?;
         inp.set_canceller(self.cancel.clone());
-        let id = cap.nonce().ok();
-        let same = id.is_some() && *lock(&self.identity) == id;
+        let same = lock(&self.identity).as_ref().is_some_and(|t| cap.same_server(t));
+        let id = if same { lock(&self.identity).clone() } else { cap.server_token().ok() };
         *lock(&self.capture) = cap;
         *lock(&self.input) = inp;
         *lock(&self.display) = d.clone();

@@ -78,6 +78,52 @@ impl Stream for DeadlineStream {
     }
 }
 
+/// What one probe of a display found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// The server answered; its `_XCUA_NONCE`, if it has one.
+    Answered(Option<String>),
+    /// Nothing listens there: no socket, or the connection was refused.
+    Absent,
+    /// Something accepted the connection and did not answer in time.
+    Silent,
+}
+
+/// Whether `e` is a reply that did not come in time, as opposed to a
+/// server that is gone or refused us.
+fn timed_out(e: &anyhow::Error) -> bool {
+    use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
+    let io = |io: &std::io::Error| io.kind() == std::io::ErrorKind::TimedOut;
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(io)
+            || matches!(c.downcast_ref::<ConnectError>(), Some(ConnectError::IoError(x)) if io(x))
+            || matches!(c.downcast_ref::<ConnectionError>(), Some(ConnectionError::IoError(x)) if io(x))
+            || matches!(c.downcast_ref::<ReplyError>(), Some(ReplyError::ConnectionError(ConnectionError::IoError(x))) if io(x))
+    })
+}
+
+/// One probe, every step within `timeout`.
+pub fn probe(display: &str, timeout: Duration) -> Probe {
+    use x11rb::errors::ConnectError;
+    let (conn, root) = match connect_within(display, timeout) {
+        Ok(c) => c,
+        Err(e) if timed_out(&e) => return Probe::Silent,
+        // A server that refuses our setup (auth) is there and answering.
+        Err(e) if e.chain().any(|c| {
+            matches!(c.downcast_ref::<ConnectError>(), Some(ConnectError::SetupFailed(_) | ConnectError::SetupAuthenticate(_)))
+        }) =>
+        {
+            return Probe::Answered(None)
+        }
+        Err(_) => return Probe::Absent,
+    };
+    match read_nonce_checked(&conn, root) {
+        Ok(n) => Probe::Answered(n),
+        Err(e) if timed_out(&e) => Probe::Silent,
+        Err(_) => Probe::Absent,
+    }
+}
+
 /// A connection whose setup and every later reply must arrive within
 /// `timeout` of now, for liveness and identity probes. Same address order
 /// and authentication as `RustConnection::connect`.
@@ -107,9 +153,9 @@ pub fn connect_within(display: &str, timeout: Duration) -> Result<(RustConnectio
     Err(anyhow!("no X server on {display}: {}", last.map(|e| e.to_string()).unwrap_or_else(|| "no address".into())))
 }
 
-/// The root-window property that identifies an X server instance: set by
-/// xcua right after it starts an Xvfb, or by the backend on a display that
-/// has none, and lost when the server restarts or resets.
+/// The root-window property that identifies an Xvfb xcua started, set
+/// right after the start and lost when the server goes. Never written on a
+/// display xcua only attached to.
 pub const NONCE_PROPERTY: &str = "_XCUA_NONCE";
 
 /// A fresh random identity.
@@ -126,12 +172,16 @@ pub fn new_nonce() -> String {
 }
 
 pub fn read_nonce<C: Connection>(conn: &C, root: Window) -> Option<String> {
-    let atom = conn.intern_atom(true, NONCE_PROPERTY.as_bytes()).ok()?.reply().ok()?.atom;
+    read_nonce_checked(conn, root).ok().flatten()
+}
+
+fn read_nonce_checked<C: Connection>(conn: &C, root: Window) -> Result<Option<String>> {
+    let atom = conn.intern_atom(true, NONCE_PROPERTY.as_bytes())?.reply()?.atom;
     if atom == x11rb::NONE {
-        return None;
+        return Ok(None);
     }
-    let r = conn.get_property(false, root, atom, AtomEnum::STRING, 0, 64).ok()?.reply().ok()?;
-    (r.type_ != x11rb::NONE && !r.value.is_empty()).then(|| String::from_utf8_lossy(&r.value).into_owned())
+    let r = conn.get_property(false, root, atom, AtomEnum::STRING, 0, 64)?.reply()?;
+    Ok((r.type_ != x11rb::NONE && !r.value.is_empty()).then(|| String::from_utf8_lossy(&r.value).into_owned()))
 }
 
 pub fn write_nonce<C: Connection>(conn: &C, root: Window, nonce: &str) -> Result<()> {
@@ -142,14 +192,34 @@ pub fn write_nonce<C: Connection>(conn: &C, root: Window, nonce: &str) -> Result
     Ok(())
 }
 
-/// The server's identity, setting one when it has none.
-pub fn ensure_nonce<C: Connection>(conn: &C, root: Window) -> Result<String> {
-    if let Some(n) = read_nonce(conn, root) {
-        return Ok(n);
+/// An in-memory identity for whatever X server a connection reaches: a
+/// private atom (`_XCUA_SESSION_<random>`) interned at connect. Atoms live
+/// as long as the server and go with a restart or a server reset, so after
+/// a reconnect the same name either maps to the same atom (same server) or
+/// to nothing (a new one). Nothing is written to any window, so this is
+/// safe on a display xcua only attached to. (The setup's resource-id base
+/// cannot serve: it is assigned per client, so it changes on every
+/// reconnect; vendor, release and root id are the same across restarts.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerToken {
+    name: String,
+    atom: u32,
+}
+
+impl ServerToken {
+    pub fn new<C: Connection>(conn: &C) -> Result<Self> {
+        let name = format!("_XCUA_SESSION_{}", new_nonce());
+        let atom = conn.intern_atom(false, name.as_bytes())?.reply().context("intern the session atom")?.atom;
+        Ok(Self { name, atom })
     }
-    let n = new_nonce();
-    write_nonce(conn, root, &n)?;
-    Ok(n)
+
+    /// Whether `conn` reaches the server this token was made on.
+    pub fn same_server<C: Connection>(&self, conn: &C) -> bool {
+        conn.intern_atom(true, self.name.as_bytes())
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.atom == self.atom)
+    }
 }
 
 /// Connect to `display` (":N"), returning the connection and its root.
@@ -376,9 +446,14 @@ impl Capture {
         self.conn.get_input_focus().is_ok_and(|c| c.reply().is_ok())
     }
 
-    /// This server's identity (`_XCUA_NONCE`), set if it has none.
-    pub fn nonce(&self) -> Result<String> {
-        ensure_nonce(&self.conn, self.root)
+    /// A token for the server this connection reaches.
+    pub fn server_token(&self) -> Result<ServerToken> {
+        ServerToken::new(&self.conn)
+    }
+
+    /// Whether this connection reaches the server `t` was made on.
+    pub fn same_server(&self, t: &ServerToken) -> bool {
+        t.same_server(&self.conn)
     }
 
     pub fn cursor_supported(&self) -> bool {
