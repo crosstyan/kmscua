@@ -1,28 +1,44 @@
 //! xcua: kmscua's MCP tools over an X server it owns (or attaches to).
 //!
 //! `xcua up` makes sure a display answers (starting an Xvfb if needed) and
-//! writes `DISPLAY=:N` to the state dir's `env` file for the agent's other
-//! processes; `xcua mcp`, `screenshot` and `doctor` do the same first. The
-//! shell's `$DISPLAY` is never used unless `--display env` says so: the
-//! agent must not land on the user's screen by accident. `--display` on any
-//! command but `up` is for that run only and leaves the state dir alone.
-//! The ownership rule for the Xvfb is in `xvfb.rs`.
+//! writes `export DISPLAY=:N` to the state dir's `env` file for the agent's
+//! other processes; `xcua mcp`, `screenshot`, `doctor` and every verb do the
+//! same first. The shell's `$DISPLAY` is never used unless `--display env`
+//! says so: the agent must not land on the user's screen by accident.
+//! `--display` on any command but `up` is for that run only and leaves the
+//! state dir alone. The ownership rule for the Xvfb is in `xvfb.rs`.
+//!
+//! The verbs (`click`, `type`, `key`, … `record`) are the MCP tools as
+//! one-shot commands, for agents that run shell commands but cannot
+//! register an MCP server. Their coordinates are pixels of the LAST
+//! `xcua screenshot`, mapped through `<state>/view.json` (see `view.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use kmscua_mcp::ServeOptions;
-use kmscua_proto::ImageFormat;
+use kmscua_mcp::{video, ServeOptions};
+use kmscua_proto::Button;
+use serde_json::json;
+use xcua::cli::{self, Ctx, Out};
+use xcua::recd;
+use xcua::view::parse_xywh;
 use xcua::xvfb::{self, Owner, State, Up};
-use xcua::{pixels, x11, XBackend};
+use xcua::XBackend;
+
+const COORDS: &str = "Coordinates are pixels of the LAST `xcua screenshot` image (mapped through <state>/view.json, as the MCP tools map them): after `screenshot --max-side 1280`, `click 640 400` is the middle of that 1280-wide image. Take a new screenshot whenever the screen may have changed.";
 
 #[derive(Parser)]
-#[command(name = "xcua", version = env!("KMSCUA_BUILD"), about = "kmscua's computer-use tools over X11 (Xvfb), in one unprivileged process")]
+#[command(
+    name = "xcua",
+    version = env!("KMSCUA_BUILD"),
+    about = "kmscua's computer-use tools over X11 (Xvfb), in one unprivileged process",
+    after_help = COORDS
+)]
 struct Cli {
-    /// Where the env file, pidfile and recordings live
+    /// Where the env file, pidfile, view and recordings live
     /// [default: $XDG_STATE_HOME/xcua or ~/.local/state/xcua].
     #[arg(long, global = true, env = "XCUA_STATE_DIR")]
     state_dir: Option<PathBuf>,
@@ -32,9 +48,13 @@ struct Cli {
     /// one run.
     #[arg(long, global = true)]
     display: Option<String>,
-    /// Screen size if an Xvfb has to be started.
-    #[arg(long, global = true, default_value = "1920x1080")]
-    size: String,
+    /// Screen size WxH if an Xvfb has to be started [default: 1920x1080].
+    /// `up` refuses when xcua's display already runs at another size.
+    #[arg(long, global = true)]
+    size: Option<String>,
+    /// Print the result as JSON (errors too, as {"ok": false, "error": …}).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -44,7 +64,17 @@ enum Cmd {
     /// Make sure a display answers: start (or adopt) xcua's Xvfb, which
     /// stays until `xcua down`, or record --display as the one to use.
     /// Idempotent.
-    Up,
+    Up {
+        /// Stop xcua's running Xvfb (and its window manager) and start a
+        /// new one, at --size. Apps on the old one close.
+        #[arg(long)]
+        restart: bool,
+        /// Window manager: `auto` (the first installed of jwm, openbox,
+        /// fluxbox, icewm, twm), `none` (stop it), or a command. Default:
+        /// leave it as it is (none on a new display). Browsers want one.
+        #[arg(long)]
+        wm: Option<String>,
+    },
     /// Stop the Xvfb xcua started and forget the display.
     Down,
     /// Display, Xvfb pid and owner, env file.
@@ -64,11 +94,13 @@ enum Cmd {
         #[arg(long, env = "XCUA_SHM", value_parser = clap::builder::FalseyValueParser::new())]
         shm: bool,
     },
-    /// Write one screenshot to a file (PNG, or JPEG for .jpg/--jpeg). Starts
-    /// an Xvfb like `up` when none is running.
+    /// Take a screenshot (PNG, or JPEG for .jpg/--jpeg). Later coordinates
+    /// are pixels of THIS image.
+    #[command(after_help = COORDS)]
     Screenshot {
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "screenshot.png")]
         output: PathBuf,
+        /// Longest side of the image; coordinates scale with it.
         #[arg(long)]
         max_side: Option<u32>,
         #[arg(long)]
@@ -78,34 +110,277 @@ enum Cmd {
         #[arg(long, env = "XCUA_SHM", value_parser = clap::builder::FalseyValueParser::new())]
         shm: bool,
     },
-    /// Display, extensions, capture path, focus, recording dir. Starts an
-    /// Xvfb like `up` when none is running.
+    /// Display, extensions, capture path, focus, window manager, recording
+    /// dir. Never starts a display.
     Doctor,
+    /// Click at X Y (last screenshot's pixels). The clicked window gets the
+    /// keyboard.
+    #[command(after_help = COORDS)]
+    Click {
+        x: i32,
+        y: i32,
+        #[arg(long, default_value = "left", value_parser = parse_button)]
+        button: Button,
+        #[arg(long, conflicts_with = "triple")]
+        double: bool,
+        #[arg(long)]
+        triple: bool,
+        /// Modifier keys held during the click, e.g. ctrl or ctrl+shift.
+        #[arg(long)]
+        mods: Option<String>,
+    },
+    /// Move the pointer to X Y (last screenshot's pixels).
+    #[command(name = "move", after_help = COORDS)]
+    Move { x: i32, y: i32 },
+    /// Drag with the left button from X1 Y1 to X2 Y2.
+    #[command(after_help = COORDS)]
+    Drag {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[arg(long)]
+        mods: Option<String>,
+    },
+    /// Wheel detents at X Y: --dy 3 scrolls down, --dy -3 up, --dx right/left.
+    #[command(after_help = COORDS, allow_negative_numbers = true)]
+    Scroll {
+        x: i32,
+        y: i32,
+        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+        dy: i32,
+        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+        dx: i32,
+        #[arg(long)]
+        mods: Option<String>,
+    },
+    /// Type text into the focused window; any Unicode. `-` reads stdin
+    /// (one trailing newline dropped). Text may start with `-`; `--` ends
+    /// the options if it looks like one.
+    Type {
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Press key chords in order, xdotool names: `key ctrl+l`, `key Return`,
+    /// `key ctrl+a BackSpace`.
+    Key {
+        #[arg(required = true)]
+        combos: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+    },
+    /// Hold a chord down for --seconds, then release it.
+    Hold {
+        keys: String,
+        #[arg(long)]
+        seconds: f32,
+    },
+    /// Where the pointer is, in the last screenshot's pixels.
+    Cursor,
+    /// Magnify X0 Y0 X1 Y1 of the last screenshot into -o at up to native
+    /// resolution. Coordinates keep referring to the last screenshot.
+    #[command(after_help = COORDS)]
+    Zoom {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        #[arg(short, long, default_value = "zoom.png")]
+        output: PathBuf,
+        #[arg(long)]
+        max_side: Option<u32>,
+    },
+    /// Wait until the screen (or --region x,y,w,h) stops changing. Exit 3
+    /// if it is still changing at --timeout.
+    WaitStable {
+        /// Milliseconds.
+        #[arg(long, default_value_t = 8000)]
+        timeout: u32,
+        /// Milliseconds the screen must stay still.
+        #[arg(long, default_value_t = 600)]
+        quiet: u32,
+        #[arg(long, default_value_t = 0.002)]
+        threshold: f32,
+        /// x,y,w,h in the last screenshot's pixels.
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// Wait until the screen (or --region x,y,w,h) differs from now. Exit 3
+    /// if nothing changed by --timeout.
+    WaitChange {
+        #[arg(long, default_value_t = 8000)]
+        timeout: u32,
+        #[arg(long, default_value_t = 0.01)]
+        threshold: f32,
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// Which window has the keyboard: id, title, class, pid, geometry.
+    Focused,
+    /// Run several actions (the MCP computer_batch shape, JSON or `-` for
+    /// stdin); stops at the first failure. Screenshots go to --out-dir.
+    Batch {
+        /// `{"actions": [...]}` or `[...]`, or `-` for stdin.
+        #[arg(value_name = "JSON")]
+        actions: String,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+    /// Record the screen as JPEG stills, across invocations.
+    #[command(subcommand)]
+    Record(RecordCmd),
 }
 
-fn main() -> Result<()> {
+#[derive(Subcommand)]
+enum RecordCmd {
+    /// Start a detached recorder; returns once it records.
+    Start {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        fps: Option<u32>,
+        #[arg(long)]
+        max_side: Option<u32>,
+        #[arg(long)]
+        max_seconds: Option<u32>,
+        /// Run the recorder in this process until SIGTERM/SIGINT (what the
+        /// detached recorder runs).
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Whether a recording runs, and how far it is.
+    Status,
+    /// Stamp a note into the recording's timeline.
+    Mark {
+        #[arg(allow_hyphen_values = true)]
+        note: String,
+    },
+    /// Stop the recording: manifest, timeline, and a contact sheet.
+    Stop {
+        /// Where to write the contact sheet [default: beside the stills].
+        #[arg(long)]
+        sheet: Option<PathBuf>,
+        #[arg(long)]
+        no_sheet: bool,
+        #[arg(long, default_value_t = 6)]
+        tiles: u32,
+    },
+    /// Evenly spaced stills from the last recording (or --path) into -o.
+    Frames {
+        #[arg(long, default_value_t = 6)]
+        count: u32,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, default_value_t = 1280)]
+        max_side: u32,
+    },
+}
+
+fn parse_button(s: &str) -> Result<Button, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "left" => Ok(Button::Left),
+        "right" => Ok(Button::Right),
+        "middle" => Ok(Button::Middle),
+        _ => Err(format!("unknown button {s}: want left, right or middle")),
+    }
+}
+
+fn mods(m: &Option<String>) -> Vec<String> {
+    m.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
         .init();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // Usage errors honour --json too; help and --version do not.
+            let wants_json = std::env::args().any(|a| a == "--json");
+            if wants_json && e.use_stderr() {
+                println!("{}", json!({ "ok": false, "error": e.to_string().trim() }));
+                std::process::exit(2);
+            }
+            e.exit();
+        }
+    };
+    let json = cli.json;
+    let code = match run(cli) {
+        Ok(out) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out.json).unwrap_or_default());
+            } else if !out.text.is_empty() {
+                println!("{}", out.text);
+            }
+            out.code
+        }
+        Err(e) => {
+            if json {
+                println!("{}", json!({ "ok": false, "error": format!("{e:#}") }));
+            } else {
+                eprintln!("xcua: error: {e:#}");
+            }
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run(cli: Cli) -> Result<Out> {
     let state = State::new(cli.state_dir.clone())?;
     let display = xvfb::explicit(cli.display.as_deref())?;
     let display = display.as_deref();
-    let size = xvfb::parse_size(&cli.size)?;
+    let size_opt = cli.size.as_deref().map(xvfb::parse_size).transpose()?;
+    let size = size_opt.unwrap_or(xvfb::DEFAULT_SIZE);
+    let ensure = |st: &State, d: Option<&str>, size: (u32, u32)| ensure(st, d, size, size_opt.is_some());
+    let open = |shm: bool| -> Result<Ctx> { Ctx::open(state.clone(), &ensure(&state, display, size)?, shm, true) };
+    // Input verbs take turns across shells (see cli::input_lock).
+    let _input = match &cli.cmd {
+        Cmd::Click { .. }
+        | Cmd::Move { .. }
+        | Cmd::Drag { .. }
+        | Cmd::Scroll { .. }
+        | Cmd::Type { .. }
+        | Cmd::Key { .. }
+        | Cmd::Hold { .. }
+        | Cmd::Batch { .. } => Some(cli::input_lock(&state)?),
+        _ => None,
+    };
+    let region = |r: &Option<String>| r.as_deref().map(parse_xywh).transpose();
     match &cli.cmd {
-        Cmd::Up => {
-            let up = xvfb::up(&state, display, size, Owner::Up)?;
-            println!("{}", describe_up(&up));
-            println!("export DISPLAY={}  (also in {})", up.display(), state.env_path().display());
-            Ok(())
+        Cmd::Up { restart, wm } => {
+            let opts = xvfb::UpOpts { size: size_opt, restart: *restart, wm: wm.clone() };
+            let (up, notes) = xvfb::up_with(&state, display, Owner::Up, size, &opts)?;
+            let (kind, pid) = match &up {
+                Up::Attached { .. } => ("attached", None),
+                Up::Reused { pid, .. } => ("reused", Some(*pid)),
+                Up::Started { pid, .. } => ("started", Some(*pid)),
+            };
+            let screen = xvfb::display_size(up.display()).map(|(w, h)| format!("{w}x{h}"));
+            let mut text = format!("{}{}", describe_up(&up), screen.as_deref().map(|s| format!(", {s}")).unwrap_or_default());
+            for n in &notes {
+                text.push_str(&format!("\n{n}"));
+            }
+            text.push_str(&format!("\nexport DISPLAY={}  (also in {})", up.display(), state.env_path().display()));
+            Ok(Out::ok(
+                text,
+                json!({ "ok": true, "result": kind, "display": up.display(), "size": screen, "pid": pid, "env_file": state.env_path(), "notes": notes, "wm": state.wm().map(|(c, p, alive)| json!({ "cmd": c, "pid": p.pid, "alive": alive })) }),
+            ))
         }
         Cmd::Down => {
-            println!("{}", xvfb::down(&state)?);
-            Ok(())
+            let msg = xvfb::down(&state)?;
+            Ok(Out::ok(msg.clone(), json!({ "ok": true, "message": msg })))
         }
         Cmd::Status => {
-            print!("{}", xvfb::status(&state));
-            Ok(())
+            let text = xvfb::status(&state);
+            let rec = recd::read(&state).map(|r| r.info);
+            Ok(Out::ok(
+                text.trim_end(),
+                json!({ "state_dir": state.dir, "display": state.display(), "pid": state.pid().map(|p| p.pid), "text": text, "recording": rec }),
+            ))
         }
         Cmd::Mcp { max_side, tools, shm } => {
             let core_only = match tools.as_str() {
@@ -113,30 +388,150 @@ fn main() -> Result<()> {
                 "core" => true,
                 other => bail!("--tools must be all or core, not {other}"),
             };
-            mcp(&state, display, size, *shm, *max_side, core_only)
+            mcp(&state, display, size, *shm, *max_side, core_only)?;
+            Ok(Out::ok("", json!({ "ok": true })))
         }
         Cmd::Screenshot { output, max_side, jpeg, no_cursor, shm } => {
-            let d = ensure(&state, display, size)?;
-            let mut cap = x11::Capture::open(&d, *shm)?;
-            let shot = cap.grab(!no_cursor, None)?;
-            let ext_jpeg = matches!(output.extension().and_then(|e| e.to_str()), Some("jpg" | "jpeg"));
-            let format = if *jpeg || ext_jpeg { ImageFormat::Jpeg } else { ImageFormat::Png };
-            let (info, bytes) = pixels::finish(shot, *max_side, format, None)?;
-            std::fs::write(output, &bytes).with_context(|| format!("write {}", output.display()))?;
-            println!(
-                "{}: {}x{} from {}x{} on {d}, grab {:.1} ms, encode {:.1} ms{}",
-                output.display(),
-                info.width,
-                info.height,
-                info.source_width,
-                info.source_height,
-                info.grab_ms,
-                info.encode_ms,
-                if cap.shm_active() { ", MIT-SHM" } else { "" }
-            );
-            Ok(())
+            Ctx::open(state.clone(), &ensure(&state, display, size)?, *shm, false)?.screenshot(output, *max_side, *jpeg, !no_cursor)
         }
         Cmd::Doctor => doctor(&state, display, size),
+        Cmd::Click { x, y, button, double, triple, mods: m } => {
+            let count = if *triple { 3 } else if *double { 2 } else { 1 };
+            open(false)?.click(*x, *y, *button, count, &mods(m))
+        }
+        Cmd::Move { x, y } => open(false)?.move_to(*x, *y),
+        Cmd::Drag { x1, y1, x2, y2, mods: m } => open(false)?.drag(Some((*x1, *y1)), (*x2, *y2), &mods(m)),
+        Cmd::Scroll { x, y, dy, dx, mods: m } => {
+            if *dx == 0 && *dy == 0 {
+                bail!("scroll needs --dy and/or --dx (detents; --dy 3 scrolls down)");
+            }
+            open(false)?.scroll(Some((*x, *y)), *dx, *dy, &mods(m))
+        }
+        Cmd::Type { text } => open(false)?.type_text(&cli::text_arg(text)?),
+        Cmd::Key { combos, repeat } => open(false)?.key(combos, *repeat),
+        Cmd::Hold { keys, seconds } => open(false)?.hold(keys, *seconds),
+        Cmd::Cursor => open(false)?.cursor(),
+        Cmd::Zoom { x0, y0, x1, y1, output, max_side } => open(false)?.zoom([*x0, *y0, *x1, *y1], output, *max_side),
+        Cmd::WaitStable { timeout, quiet, threshold, region: r } => open(false)?.wait_stable(region(r)?, *quiet, *timeout, *threshold),
+        Cmd::WaitChange { timeout, threshold, region: r } => open(false)?.wait_change(region(r)?, *timeout, *threshold),
+        Cmd::Focused => open(false)?.focused(),
+        Cmd::Batch { actions: text, out_dir } => {
+            let actions = cli::parse_batch(&cli::text_arg(text)?)?;
+            let dir = out_dir.clone().unwrap_or_else(|| cli::shots_dir(&state));
+            open(false)?.batch(&actions, &dir)
+        }
+        Cmd::Record(rc) => record(&state, display, size, rc),
+    }
+}
+
+fn record(state: &State, display: Option<&str>, size: (u32, u32), rc: &RecordCmd) -> Result<Out> {
+    match rc {
+        RecordCmd::Start { name, fps, max_side, max_seconds, foreground } => {
+            let opts = recd::StartOpts { name: name.clone(), fps: *fps, max_side: *max_side, max_seconds: *max_seconds };
+            let d = ensure(state, display, size, false)?;
+            let s = if *foreground { recd::foreground(state, &d, &opts)? } else { recd::start(state, &d, &opts)? };
+            let i = &s.info;
+            Ok(Out::ok(
+                format!(
+                    "{} {} at {}x{} {} fps with {}",
+                    if i.recording { "recording" } else { "recorded" },
+                    i.path.as_deref().unwrap_or("?"),
+                    i.width,
+                    i.height,
+                    i.fps,
+                    i.codec.as_deref().unwrap_or("?")
+                ),
+                serde_json::to_value(&s)?,
+            ))
+        }
+        RecordCmd::Status => {
+            let live = recd::running(state).is_some();
+            match recd::read(state) {
+                Some(s) => Ok(Out::ok(
+                    format!(
+                        "{} {} | {:.1}s, {} stills, {} dropped{}",
+                        if live && s.info.recording { "recording" } else { "not recording; last" },
+                        s.info.path.as_deref().unwrap_or("?"),
+                        s.info.seconds,
+                        s.info.frames,
+                        s.info.dropped,
+                        s.info.error.as_deref().map(|e| format!(" | {e}")).unwrap_or_default()
+                    ),
+                    json!({ "recording": live && s.info.recording, "state": s }),
+                )),
+                None => Ok(Out::ok("not recording", json!({ "recording": false }))),
+            }
+        }
+        RecordCmd::Mark { note } => {
+            recd::mark(state, note)?;
+            Ok(Out::ok("OK", json!({ "ok": true })))
+        }
+        RecordCmd::Stop { sheet, no_sheet, tiles } => {
+            let s = recd::stop(state)?;
+            let i = &s.info;
+            let path = PathBuf::from(i.path.clone().unwrap_or_default());
+            let mut lines = vec![format!(
+                "recording {} | {:.1}s, {} stills at {} fps, {}x{}, {} | finalized={}{} | manifest {}",
+                path.display(),
+                i.seconds,
+                i.frames,
+                i.fps,
+                i.width,
+                i.height,
+                i.codec.as_deref().unwrap_or("?"),
+                i.finalized.unwrap_or(false),
+                i.error.as_deref().map(|e| format!(" | {e}")).unwrap_or_default(),
+                s.manifest.as_deref().unwrap_or("?")
+            )];
+            if !s.timeline.is_empty() {
+                lines.push("timeline:".into());
+                for (n, (t, what)) in s.timeline.iter().enumerate() {
+                    lines.push(format!("  [{n}] {t:7.2}s  {what}"));
+                }
+            }
+            let mut sheet_path = None;
+            if !no_sheet {
+                let out = sheet.clone().unwrap_or_else(|| path.with_extension("sheet.png"));
+                match video::contact_sheet(&path, i.seconds.max(0.1), (*tiles).clamp(1, 16), 480) {
+                    Ok((png, times)) => {
+                        std::fs::write(&out, png)?;
+                        lines.push(format!(
+                            "contact sheet {} (tiles left to right, top to bottom, at seconds: {})",
+                            out.display(),
+                            times.iter().map(|t| format!("{t:.1}")).collect::<Vec<_>>().join(", ")
+                        ));
+                        sheet_path = Some(out);
+                    }
+                    Err(e) => lines.push(format!("contact sheet unavailable: {e:#}")),
+                }
+            }
+            Ok(Out::ok(lines.join("\n"), json!({ "state": s, "sheet": sheet_path })))
+        }
+        RecordCmd::Frames { count, output, path, max_side } => {
+            let rec = recd::recording_path(state, path.as_deref())?;
+            let dur = video::duration(&rec)?;
+            let n = (*count).clamp(1, 100);
+            let times: Vec<f32> =
+                (0..n).map(|k| if n == 1 { 0.0 } else { (dur - 0.05).max(0.0) * k as f32 / (n - 1) as f32 }).collect();
+            std::fs::create_dir_all(output)?;
+            let mut written: Vec<(f32, PathBuf)> = Vec::new();
+            let mut last: Option<Vec<u8>> = None;
+            for (t, png) in video::frames_at(&rec, &times, *max_side, None)? {
+                // A short or cut-off recording maps several times to the
+                // same still: keep one of each picture.
+                if last.as_ref() == Some(&png) {
+                    continue;
+                }
+                last = Some(png.clone());
+                let p = output.join(format!("frame-{:02}-{:07.2}s.png", written.len(), t));
+                std::fs::write(&p, png)?;
+                written.push((t, p));
+            }
+            Ok(Out::ok(
+                written.iter().map(|(t, p)| format!("t={t:.2}s {}", p.display())).collect::<Vec<_>>().join("\n"),
+                json!({ "recording": rec, "frames": written.iter().map(|(t, p)| json!({ "t": t, "path": p })).collect::<Vec<_>>() }),
+            ))
+        }
     }
 }
 
@@ -150,8 +545,10 @@ fn describe_up(up: &Up) -> String {
 
 /// The display for a one-shot command. `--display` is used as given and
 /// the state dir is not touched; otherwise `up`, with a line on stderr when
-/// an Xvfb had to be started (it stays, as after `xcua up`).
-fn ensure(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<String> {
+/// an Xvfb had to be started (it stays, as after `xcua up`). A running
+/// display is used whatever its size; an explicit `--size` that differs
+/// gets a warning, since only `up --restart` changes it.
+fn ensure(state: &State, display: Option<&str>, size: (u32, u32), size_explicit: bool) -> Result<String> {
     if let Some(d) = display {
         if !xvfb::answers(d) {
             bail!("no X server answers on {d}");
@@ -161,6 +558,17 @@ fn ensure(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<Stri
     let up = xvfb::up(state, None, size, Owner::Up)?;
     if matches!(up, Up::Started { .. }) {
         eprintln!("{}", describe_up(&up));
+    } else if size_explicit {
+        if let Some((w, h)) = xvfb::display_size(up.display()).filter(|&s| s != size) {
+            eprintln!(
+                "xcua: {} runs at {w}x{h}, not {}x{}; using it as it is (`xcua up --size {}x{} --restart` changes it)",
+                up.display(),
+                size.0,
+                size.1,
+                size.0,
+                size.1
+            );
+        }
     }
     Ok(up.display().to_string())
 }
@@ -170,7 +578,7 @@ fn mcp(state: &State, display: Option<&str>, size: (u32, u32), shm: bool, max_si
     // Before the runtime: the Xvfb must not inherit tokio's threads' state.
     // With --display the state dir is not touched and nothing is released.
     let d = match display {
-        Some(d) => ensure(state, Some(d), size)?,
+        Some(d) => ensure(state, Some(d), size, false)?,
         None => {
             let up = xvfb::up(state, None, size, Owner::Mcp(me))?;
             log::info!("xcua mcp: {up:?}");
@@ -263,42 +671,104 @@ fn instructions(display: &str, state: &State) -> String {
     )
 }
 
-fn doctor(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<()> {
-    let d = match ensure(state, display, size) {
+/// Never starts a display: with none running it says what `up` would
+/// start.
+fn doctor(state: &State, display: Option<&str>, size: (u32, u32)) -> Result<Out> {
+    let mut out = xvfb::status(state);
+    let found = match display {
+        Some(d) => xvfb::answers(d).then(|| d.to_string()).ok_or_else(|| format!("no X server answers on {d}")),
+        None => state.current().ok_or_else(|| "no display running".to_string()),
+    };
+    let d = match found {
         Ok(d) => d,
-        Err(e) => {
-            print!("{}", xvfb::status(state));
-            println!("display: unavailable: {e:#}");
-            return Ok(());
+        Err(why) => {
+            let xvfb_bin = xvfb::on_path("Xvfb");
+            let wm = xvfb::find_wm();
+            // status already said "display: none"; an explicit one gets its reason.
+            if display.is_some() {
+                out.push_str(&format!("display: {why}\n"));
+            }
+            out.push_str(&format!(
+                "`xcua up` would start: Xvfb {} at {}x{}\n",
+                xvfb_bin.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(NOT FOUND on PATH: install xvfb)".into()),
+                size.0,
+                size.1
+            ));
+            out.push_str("extensions: unknown until `xcua up`\n");
+            out.push_str(&format!(
+                "window manager for `up --wm auto`: {}\n",
+                wm.unwrap_or("none installed (looked for jwm, openbox, fluxbox, icewm, twm)")
+            ));
+            return Ok(Out::ok(
+                out.trim_end(),
+                json!({ "ok": true, "display": null, "reason": why, "would_start": { "xvfb": xvfb_bin, "size": format!("{}x{}", size.0, size.1), "extensions": "unknown until up", "wm_auto": wm } }),
+            ));
         }
     };
-    print!("{}", xvfb::status(state));
     let b = XBackend::open(&d, env_flag("XCUA_SHM"), &state.recordings())?;
     let r = b.doctor_report();
     let s = |k: &str| r[k].as_str().unwrap_or("?").to_string();
-    println!("using display: {} ({})", s("display"), s("size"));
+    let mut line = |l: String| {
+        out.push_str(&l);
+        out.push('\n');
+    };
+    line(format!("using display: {} ({})", s("display"), s("size")));
     if let Some(ext) = r["extensions"].as_object() {
         let list: Vec<String> = ext
             .iter()
             .map(|(k, v)| format!("{k} {}", if v.as_bool() == Some(true) { "yes" } else { "NO" }))
             .collect();
-        println!("extensions: {}", list.join(", "));
+        line(format!("extensions: {}", list.join(", ")));
     }
-    println!("capture: {}", s("capture"));
-    println!(
+    line(format!("capture: {}", s("capture")));
+    line(format!(
         "window manager: {}",
         if r["window_manager"].as_bool() == Some(true) { "yes (it handles focus)" } else { "none (xcua focuses the clicked window)" }
-    );
-    println!("spare keycodes: {}", r["spare_keycodes"]);
-    println!("recording dir: {} (codec {})", s("record_dir"), xcua::backend::RECORD_CODEC);
-    println!("focus:");
-    for line in s("focus").lines() {
-        println!("  {line}");
+    ));
+    line(format!("spare keycodes: {}", r["spare_keycodes"]));
+    line(format!("recording dir: {} (codec {})", s("record_dir"), xcua::backend::RECORD_CODEC));
+    line("focus:".into());
+    for l in s("focus").lines() {
+        line(format!("  {l}"));
     }
     if let Some(notes) = r["notes"].as_array() {
         for n in notes {
-            println!("note: {}", n.as_str().unwrap_or_default());
+            line(format!("note: {}", n.as_str().unwrap_or_default()));
         }
     }
-    Ok(())
+    Ok(Out::ok(out.trim_end(), r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// A subcommand argument with a global's name (`batch`'s positional was
+    /// once called `json`) panics only when parsed; debug_assert misses it.
+    #[test]
+    fn batch_and_global_json_parse_together() {
+        let c = Cli::try_parse_from(["xcua", "--json", "batch", "[]"]).unwrap();
+        assert!(c.json);
+        assert!(matches!(&c.cmd, Cmd::Batch { actions, .. } if actions == "[]"));
+    }
+
+    #[test]
+    fn text_may_start_with_a_hyphen() {
+        let c = Cli::try_parse_from(["xcua", "type", "-5 degrees"]).unwrap();
+        assert!(matches!(&c.cmd, Cmd::Type { text } if text == "-5 degrees"));
+        let c = Cli::try_parse_from(["xcua", "record", "mark", "-x"]).unwrap();
+        assert!(matches!(&c.cmd, Cmd::Record(RecordCmd::Mark { note }) if note == "-x"));
+    }
+
+    #[test]
+    fn negative_scroll_parses() {
+        let c = Cli::try_parse_from(["xcua", "scroll", "1", "2", "--dy", "-3"]).unwrap();
+        assert!(matches!(c.cmd, Cmd::Scroll { dy: -3, .. }));
+    }
 }

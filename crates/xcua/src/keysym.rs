@@ -100,6 +100,22 @@ pub fn name_to_keysym(name: &str) -> Option<u32> {
     Some(k)
 }
 
+/// `parse_combo`, saying which name it did not know.
+pub fn parse_combo_named(keys: &[String]) -> Result<Vec<u32>, String> {
+    if let Some(v) = parse_combo(keys) {
+        return Ok(v);
+    }
+    let bad = keys
+        .iter()
+        .flat_map(|k| if k.trim() == "+" { vec![] } else { k.split('+').map(str::to_string).collect() })
+        .find(|part| name_to_keysym(part).is_none());
+    Err(match bad {
+        Some(b) if b.trim().is_empty() => format!("empty key name in {keys:?}"),
+        Some(b) => format!("unknown key name: {b} (xdotool names: ctrl, shift, alt, super, Return, Escape, Tab, BackSpace, F1, a, …)"),
+        None => format!("no keys in {keys:?}"),
+    })
+}
+
 /// Parse "ctrl+shift+t" or ["ctrl","shift","t"] style chords into keysyms.
 /// A lone "+" is the plus key.
 pub fn parse_combo(keys: &[String]) -> Option<Vec<u32>> {
@@ -200,6 +216,7 @@ mod tests {
         assert_eq!(name_to_keysym("A"), Some(0x61));
         assert_eq!(parse_combo(&["ctrl".into(), "+".into()]), Some(vec![0xffe3, 0x3d]));
         assert_eq!(name_to_keysym("nosuchkey"), None);
+        assert_eq!(parse_combo_named(&["ctrl+question".into()]).unwrap_err().split(' ').take(4).collect::<Vec<_>>().join(" "), "unknown key name: question");
     }
 
     #[test]

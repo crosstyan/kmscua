@@ -6,10 +6,13 @@
 //! that have no GPU, DRM or uinput: an Xvfb is the screen.
 
 pub mod backend;
+pub mod cli;
 pub mod input;
 pub mod keysym;
 pub mod pixels;
+pub mod recd;
 pub mod record;
+pub mod view;
 pub mod x11;
 pub mod xvfb;
 

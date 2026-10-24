@@ -46,6 +46,26 @@
 //! display for the one run and leaves the state dir alone; `up --display`
 //! records the attach, and refuses while xcua's own Xvfb is running.
 //!
+//! Size: `xcua up --size WxH` refuses when xcua's display already runs at
+//! another size, unless `--restart` (which closes the apps on it). Commands
+//! that start a display on their own (`mcp`, the verbs) start it at
+//! `--size` (default 1920x1080) and otherwise use whatever runs. `doctor`
+//! never starts one.
+//!
+//! Window manager: none by default (xcua gives the clicked window the
+//! keyboard itself). `up --wm auto` starts the first installed of
+//! [`WM_CANDIDATES`] on xcua's display, `--wm <cmd>` that command, `--wm
+//! none` stops it. It is tracked like the Xvfb: `wm.pid` (pid and start
+//! time), `wm.cmd`, its output in `wm.log`; `down` stops it, `status` and
+//! `doctor` report it, and one that died is reported, never restarted
+//! behind the agent's back. With a WM running, focus is the WM's (twm,
+//! for one, gives it to the window under the pointer). twm is started with
+//! a generated `twmrc` in the state dir: its defaults place a new window
+//! interactively with the server grabbed, which stalls every screenshot
+//! until someone clicks. Without `/proc` a WM is never signalled (its pid
+//! cannot be told from a recycled one); it is forgotten, and ends with its
+//! X server.
+//!
 //! The ownership rule: an Xvfb started (or adopted) by `xcua up` stays
 //! until `xcua down`. One that an `xcua mcp` started is shared by every
 //! `xcua mcp` that finds it, and stopped when the last live user leaves.
@@ -72,6 +92,22 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long xcua's own Xvfb may stay silent before `up` acts on it.
 const PATIENCE: Duration = Duration::from_secs(10);
+/// Screen size when nothing says otherwise.
+pub const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
+/// What `--wm auto` looks for, in this order.
+pub const WM_CANDIDATES: &[&str] = &["jwm", "openbox", "fluxbox", "icewm", "twm"];
+
+/// What `xcua up` asks for beyond "a display that answers".
+#[derive(Clone, Debug, Default)]
+pub struct UpOpts {
+    /// `--size` given explicitly: a running display of another size is
+    /// refused unless `restart`.
+    pub size: Option<(u32, u32)>,
+    /// Stop xcua's running Xvfb (and WM) and start a new one.
+    pub restart: bool,
+    /// `--wm`: "auto", "none" or a command. None leaves the WM as it is.
+    pub wm: Option<String>,
+}
 
 /// What the state dir's Xvfb is doing.
 #[derive(Debug, PartialEq, Eq)]
@@ -153,14 +189,14 @@ impl Proc {
         Some(Self { pid, start: start_time(pid) })
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         let mut it = s.split_whitespace();
         let pid = it.next()?.parse::<u64>().ok()?;
         let pid = valid_pid(pid)? as u32;
         Some(Self { pid, start: it.next().and_then(|t| t.parse().ok()) })
     }
 
-    fn line(&self) -> String {
+    pub fn line(&self) -> String {
         match self.start {
             Some(t) => format!("{} {t}\n", self.pid),
             None => format!("{}\n", self.pid),
@@ -176,7 +212,7 @@ impl Proc {
     }
 
     /// Alive and the same process (any program): for `users/` entries.
-    fn is_same(&self) -> bool {
+    pub fn is_same(&self) -> bool {
         valid_pid(self.pid as u64).is_some() && alive(self.pid) && self.start.is_none_or(|t| start_time(self.pid) == Some(t))
     }
 }
@@ -259,6 +295,24 @@ impl State {
     }
     fn nonce_path(&self) -> PathBuf {
         self.dir.join("nonce")
+    }
+    fn wm_pid_path(&self) -> PathBuf {
+        self.dir.join("wm.pid")
+    }
+    fn wm_cmd_path(&self) -> PathBuf {
+        self.dir.join("wm.cmd")
+    }
+    pub fn wm_log_path(&self) -> PathBuf {
+        self.dir.join("wm.log")
+    }
+
+    /// The window manager xcua started: its command, process, and whether
+    /// it is still running.
+    pub fn wm(&self) -> Option<(String, Proc, bool)> {
+        let cmd = fs::read_to_string(self.wm_cmd_path()).ok()?.trim().to_string();
+        let p = Proc::parse(&fs::read_to_string(self.wm_pid_path()).ok()?)?;
+        let alive = p.is_same();
+        Some((cmd, p, alive))
     }
 
     /// The identity of xcua's Xvfb, as set on its root window.
@@ -395,6 +449,8 @@ impl State {
     fn clear(&self) {
         remove(&self.env_path());
         remove(&self.pid_path());
+        remove(&self.wm_pid_path());
+        remove(&self.wm_cmd_path());
         remove(&self.nonce_path());
         remove(&self.owner_path());
         let _ = fs::remove_dir_all(self.users_dir());
@@ -423,6 +479,12 @@ impl State {
             Probe::Answered(_) | Probe::Absent => Liveness::Gone,
             Probe::Silent => Liveness::Silent(display, pid),
         }
+    }
+
+    /// The display a command would use without starting one: xcua's live
+    /// Xvfb, or one recorded by `up --display`.
+    pub fn current(&self) -> Option<String> {
+        self.live().map(|(d, _)| d).or_else(|| self.attached())
     }
 
     /// A display recorded by `up --display` (no pidfile) that answers.
@@ -664,10 +726,26 @@ pub fn explicit(display: Option<&str>) -> Result<Option<String>> {
 /// the module doc for the order and the ownership rule). An `mcp` caller
 /// (`Owner::Mcp`) is registered as a user of xcua's Xvfb.
 pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) -> Result<Up> {
+    up_with(state, display, owner, size, &UpOpts::default()).map(|(up, _)| up)
+}
+
+/// `up` with the size check, `--restart` and `--wm` (see the module doc).
+/// `start_size` is used when a display has to be started and `opts.size`
+/// does not say. Answers what happened and notes for the user (the WM).
+pub fn up_with(state: &State, display: Option<&str>, owner: Owner, start_size: (u32, u32), opts: &UpOpts) -> Result<(Up, Vec<String>)> {
     let _lock = state.lock()?;
+    let size = opts.size.unwrap_or(start_size);
+    // A restart brings back the WM that ran, unless --wm says otherwise.
+    let mut wm_want = opts.wm.clone();
     if let Some(d) = display {
+        if opts.restart {
+            bail!("--restart restarts xcua's own Xvfb; {d} is not xcua's to restart");
+        }
+        if opts.wm.as_deref().is_some_and(|w| w != "none") {
+            bail!("--wm starts a window manager on xcua's own Xvfb only, not on {d}");
+        }
         match state.check(PATIENCE) {
-            Liveness::Live(own, p) if own == d => return reuse(state, owner, own, p),
+            Liveness::Live(own, p) if own == d => return reuse(state, owner, own, p).map(|u| (u, Vec::new())),
             Liveness::Live(own, p) | Liveness::Silent(own, p) => bail!(
                 "xcua's own Xvfb {own} (pid {}) is running for {}; run `xcua down` first, or use --display without `up`",
                 p.pid,
@@ -680,10 +758,32 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
         }
         state.clear();
         state.write(d, None, None)?;
-        return Ok(Up::Attached { display: d.to_string() });
+        return Ok((Up::Attached { display: d.to_string() }, Vec::new()));
     }
     match state.check(PATIENCE) {
-        Liveness::Live(d, p) => return reuse(state, owner, d, p),
+        Liveness::Live(d, p) => {
+            let running = display_size(&d);
+            let mismatch = opts.size.zip(running).filter(|(want, have)| want != have);
+            if let (Some(((ww, wh), (hw, hh))), false) = (mismatch, opts.restart) {
+                bail!(
+                    "xcua's display {d} is running at {hw}x{hh}; `xcua up --size {ww}x{wh} --restart` restarts it at {ww}x{wh} (apps on it will close)"
+                );
+            }
+            if !opts.restart {
+                let up = reuse(state, owner, d.clone(), p)?;
+                let notes = apply_wm(state, &d, opts.wm.as_deref())?;
+                return Ok((up, notes));
+            }
+            let nonce = state.nonce();
+            if wm_want.is_none() {
+                wm_want = state.wm().filter(|(_, _, alive)| *alive).map(|(cmd, _, _)| cmd);
+            }
+            stop_wm(state);
+            if stop(&p, Some(&d), nonce.as_deref()) == Stopped::StillAnswering {
+                bail!("xcua's Xvfb on {d} (pid {}) did not stop; not restarting", p.pid);
+            }
+            state.clear();
+        }
         Liveness::Silent(d, p) => {
             // Never on one missed probe, never on a running process: only a
             // stopped Xvfb that /proc confirms is xcua's is replaced.
@@ -701,9 +801,14 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
         Liveness::Gone => {}
     }
     if let Some(d) = state.attached() {
-        return Ok(Up::Attached { display: d });
+        if opts.restart || opts.wm.as_deref().is_some_and(|w| w != "none") {
+            bail!("{d} was attached with `up --display`, not started by xcua; `xcua down` first");
+        }
+        return Ok((Up::Attached { display: d }, Vec::new()));
     }
-    // Whatever the state dir said is stale now.
+    // Whatever the state dir said is stale now. A WM that outlived its
+    // display goes with it.
+    stop_wm(state);
     state.clear();
     let (mut child, display) = spawn(size, Some(&state.log_path()))?;
     let proc = Proc::now(child.id()).ok_or_else(|| anyhow!("Xvfb pid {} out of range", child.id()))?;
@@ -721,7 +826,136 @@ pub fn up(state: &State, display: Option<&str>, size: (u32, u32), owner: Owner) 
     if let Owner::Mcp(me) = owner {
         state.add_user(me)?;
     }
-    Ok(Up::Started { display, pid: proc.pid })
+    let notes = apply_wm(state, &display, wm_want.as_deref())?;
+    Ok((Up::Started { display, pid: proc.pid }, notes))
+}
+
+/// The size of `display`'s root window, within 2 s.
+pub fn display_size(display: &str) -> Option<(u32, u32)> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let (conn, root) = crate::x11::connect_within(display, ANSWER_TIMEOUT).ok()?;
+    let g = conn.get_geometry(root).ok()?.reply().ok()?;
+    Some((g.width as u32, g.height as u32))
+}
+
+/// The first of [`WM_CANDIDATES`] on PATH.
+pub fn find_wm() -> Option<&'static str> {
+    WM_CANDIDATES.iter().copied().find(|w| on_path(w).is_some())
+}
+
+/// `bin`'s full path if it is on PATH.
+pub fn on_path(bin: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(bin)).find(|p| p.is_file())
+}
+
+/// Bring the WM in line with `--wm` (None: leave it, and say if it died).
+fn apply_wm(state: &State, display: &str, want: Option<&str>) -> Result<Vec<String>> {
+    let current = state.wm();
+    let Some(want) = want else {
+        return Ok(match current {
+            Some((cmd, p, false)) => vec![format!(
+                "window manager {cmd} (pid {}) has died; see {}. `xcua up --wm auto` starts one again",
+                p.pid,
+                state.wm_log_path().display()
+            )],
+            _ => Vec::new(),
+        });
+    };
+    if want == "none" {
+        return Ok(stop_wm(state).into_iter().collect());
+    }
+    let cmd = if want == "auto" {
+        find_wm()
+            .ok_or_else(|| anyhow!("--wm auto: no window manager installed (looked for {})", WM_CANDIDATES.join(", ")))?
+            .to_string()
+    } else {
+        want.to_string()
+    };
+    let cmd = if cmd == "twm" { twm_with_rc(state)? } else { cmd };
+    if let Some((old, p, true)) = &current {
+        if *old == cmd {
+            return Ok(vec![format!("window manager {cmd} already running (pid {})", p.pid)]);
+        }
+    }
+    let mut notes: Vec<String> = stop_wm(state).into_iter().collect();
+    notes.push(start_wm(state, display, &cmd)?);
+    Ok(notes)
+}
+
+/// twm's defaults make it place each new window by hand with the server
+/// grabbed: nothing else, screenshots included, gets an answer until a
+/// click. This rc places windows at once and never grabs. (This twm has no
+/// click-to-focus; focus follows the pointer.)
+const TWMRC: &str = "# Written by xcua for `up --wm auto`.\nRandomPlacement\nNoGrabServer\nDontMoveOff\nUsePPosition \"on\"\n";
+
+/// `twm -f <state>/twmrc`, writing the rc.
+fn twm_with_rc(state: &State) -> Result<String> {
+    let rc = state.dir.join("twmrc");
+    write_atomic(&rc, TWMRC)?;
+    let path = rc.to_str().ok_or_else(|| anyhow!("state dir path is not UTF-8"))?;
+    if path.contains(|c: char| c.is_whitespace() || "'\"$`\\".contains(c)) {
+        bail!("state dir {path} has characters twm's command line cannot carry; use another --state-dir");
+    }
+    Ok(format!("twm -f {path}"))
+}
+
+/// Start `cmd` (through `sh -c exec`, so the pid is the WM's) on `display`.
+fn start_wm(state: &State, display: &str, cmd: &str) -> Result<String> {
+    let log = fs::File::create(state.wm_log_path()).with_context(|| format!("create {}", state.wm_log_path().display()))?;
+    let mut c = Command::new("sh");
+    c.arg("-c")
+        .arg(format!("exec {cmd}"))
+        .env("DISPLAY", display)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = c.spawn().with_context(|| format!("start window manager {cmd:?}"))?;
+    let p = Proc::now(child.id()).ok_or_else(|| anyhow!("window manager pid out of range"))?;
+    // One that cannot open the display or parse its config exits at once.
+    std::thread::sleep(Duration::from_millis(400));
+    if let Some(status) = child.try_wait()? {
+        let text = fs::read_to_string(state.wm_log_path()).unwrap_or_default();
+        let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+        bail!("window manager {cmd:?} exited at once ({status}): {last}");
+    }
+    write_atomic(&state.wm_pid_path(), &p.line())?;
+    write_atomic(&state.wm_cmd_path(), &format!("{cmd}\n"))?;
+    // Not waited for: it outlives us, and init reaps it.
+    drop(child);
+    Ok(format!("started window manager {cmd} on {display} (pid {}); log {}", p.pid, state.wm_log_path().display()))
+}
+
+/// Stop the WM xcua started, if it still runs; forget it either way.
+/// Without `/proc` it is only forgotten: a live pid there may be anyone's.
+fn stop_wm(state: &State) -> Option<String> {
+    let (cmd, p, alive) = state.wm()?;
+    remove(&state.wm_pid_path());
+    remove(&state.wm_cmd_path());
+    if !have_proc() {
+        return Some(format!(
+            "forgot window manager {cmd} (pid {}): without /proc its pid cannot be confirmed, so it is not signalled; it ends with its X server",
+            p.pid
+        ));
+    }
+    if !alive {
+        return Some(format!("window manager {cmd} (pid {}) had already exited", p.pid));
+    }
+    let pid = valid_pid(p.pid as u64)?;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while p.is_same() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if p.is_same() {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    Some(format!("stopped window manager {cmd} (pid {})", p.pid))
 }
 
 /// `up` adopts any Xvfb so it stays; an `mcp` registers as a user and
@@ -753,6 +987,7 @@ fn reuse(state: &State, owner: Owner, display: String, p: Proc) -> Result<Up> {
 pub fn down(state: &State) -> Result<String> {
     let _lock = state.lock()?;
     let nonce = state.nonce();
+    let wm = stop_wm(state).map(|m| format!("{m}\n")).unwrap_or_default();
     let msg = match (state.pid(), state.display()) {
         (Some(p), d) => match stop(&p, d.as_deref(), nonce.as_deref()) {
             Stopped::Yes => format!("stopped Xvfb {} (pid {})", d.unwrap_or_default(), p.pid),
@@ -775,7 +1010,7 @@ pub fn down(state: &State) -> Result<String> {
         (None, None) => "nothing to stop".to_string(),
     };
     state.clear();
-    Ok(msg)
+    Ok(format!("{wm}{msg}"))
 }
 
 /// What `xcua mcp` calls on exit: leave the users list, and stop xcua's
@@ -788,6 +1023,7 @@ pub fn release(state: &State, me: u32) {
         return;
     }
     let nonce = state.nonce();
+    stop_wm(state);
     if stop(&p, state.display().as_deref(), nonce.as_deref()) != Stopped::StillAnswering {
         state.clear();
     }
@@ -870,6 +1106,18 @@ pub fn status(state: &State) -> String {
             ));
         }
         None if state.display().is_some() => s.push_str("xvfb: not started by xcua (attached with `up --display`)\n"),
+        None => {}
+    }
+    match state.wm() {
+        Some((cmd, p, true)) => s.push_str(&format!("window manager: {cmd} (pid {}, running; it owns focus)\n", p.pid)),
+        Some((cmd, p, false)) => s.push_str(&format!(
+            "window manager: {cmd} (pid {}) DIED; see {}. `xcua up --wm auto` starts one again\n",
+            p.pid,
+            state.wm_log_path().display()
+        )),
+        None if state.pid().is_some() => {
+            s.push_str("window manager: none (xcua gives the clicked window the keyboard; `xcua up --wm auto` starts one)\n")
+        }
         None => {}
     }
     s

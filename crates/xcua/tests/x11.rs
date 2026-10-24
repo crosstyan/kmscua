@@ -787,3 +787,299 @@ fn attached_display_is_not_marked() {
     drop(cli);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The CLI verbs map coordinates through the last screenshot's view, as the
+/// MCP tools do: after `screenshot --max-side 320` of a 640x480 screen,
+/// `click 100 88` lands on screen (200, 176), focuses the window there, and
+/// `type` reaches it.
+#[test]
+fn cli_verbs_map_through_the_last_screenshot() {
+    let Some(x) = xvfb("verbs") else { return };
+    let (conn, win) = red_window(&x.display);
+    let cli = Cli::new(x.dir.join("state"), None);
+    let d = x.display.as_str();
+    let shot = x.dir.join("half.png");
+    std::fs::create_dir_all(&x.dir).unwrap();
+    let out = cli.ok(&["--display", d, "screenshot", "-o", shot.to_str().unwrap(), "--max-side", "320"]);
+    assert!(out.contains("320x240 of 640x480"), "{out}");
+    let view: serde_json::Value = serde_json::from_slice(&std::fs::read(cli.state.join("view.json")).unwrap()).unwrap();
+    assert_eq!(view["scale"], 2.0);
+
+    assert_eq!(cli.ok(&["--display", d, "click", "100", "88"]).trim(), "OK");
+    assert_eq!(conn.get_input_focus().unwrap().reply().unwrap().focus, win, "click did not focus the window");
+    let press = wait_events(&conn, 1, Duration::from_secs(5), |e| matches!(e, Event::ButtonPress(_)));
+    match press.first() {
+        Some(Event::ButtonPress(p)) => assert_eq!((p.root_x, p.root_y), (200, 176), "click not mapped through the view"),
+        other => panic!("no ButtonPress: {other:?}"),
+    }
+    let cursor: serde_json::Value = serde_json::from_str(&cli.ok(&["--display", d, "--json", "cursor"])).unwrap();
+    assert_eq!((cursor["x"].as_i64(), cursor["y"].as_i64()), (Some(100), Some(88)));
+    assert_eq!(cursor["screen"], serde_json::json!([200, 176]));
+
+    let map = xcua::input::Input::open(d).unwrap().keymap().unwrap();
+    cli.ok(&["--display", d, "type", "hI"]);
+    let keys: Vec<u8> = wait_events(&conn, 3, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_)))
+        .into_iter()
+        .filter_map(|e| if let Event::KeyPress(k) = e { Some(k.detail) } else { None })
+        .collect();
+    let (h, i, shift) = (map.lookup(0x68).unwrap().0, map.lookup(0x69).unwrap().0, map.lookup(xcua::keysym::SHIFT_L).unwrap().0);
+    assert_eq!(keys, vec![h, shift, i]);
+
+    // batch: the MCP computer_batch shape, mapped the same way; a
+    // screenshot inside it becomes the view; it stops at the first failure.
+    let shots = x.dir.join("shots");
+    let out = cli.ok(&[
+        "--display", d, "batch", "--out-dir", shots.to_str().unwrap(),
+        r#"{"actions": [{"action": "left_click", "coordinate": [100, 88]}, {"action": "type", "text": "ok"}, {"action": "screenshot"}]}"#,
+    ]);
+    assert!(out.contains("[0] left_click: OK") && out.contains("[2] screenshot: "), "{out}");
+    assert_eq!(wait_events(&conn, 2, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_))).len(), 2);
+    let view: serde_json::Value = serde_json::from_slice(&std::fs::read(cli.state.join("view.json")).unwrap()).unwrap();
+    assert_eq!(view["max_side"], 320, "the batch screenshot kept the view's max_side");
+    let (ok, text) = cli.run(&["--display", d, "batch", r#"[{"action": "left_click"}, {"action": "type", "text": "x"}]"#]);
+    assert!(!ok && text.contains("needs `coordinate`") && text.contains("Not executed"), "{text}");
+
+    // Errors exit non-zero with a message, as JSON with --json.
+    let (ok, text) = cli.run(&["--display", d, "--json", "key", "ctrl+nosuchkey"]);
+    let err: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    assert!(!ok && err["ok"] == false && err["error"].as_str().unwrap().contains("unknown key name: nosuchkey"), "{text}");
+
+    // `type -` drops the one newline echo adds: no Return.
+    let mut child = cli
+        .cmd()
+        .args(["--display", d, "type", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"ab\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    let typed = wait_events(&conn, 2, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_)));
+    assert_eq!(typed.len(), 2, "echo's newline was typed as Return");
+
+    // Two shells typing at once take turns instead of interleaving.
+    let a = cli.cmd().args(["--display", d, "type", "aaaaaaaaaaaaaaaaaaaa"]).spawn().unwrap();
+    let b = cli.cmd().args(["--display", d, "type", "bbbbbbbbbbbbbbbbbbbb"]).spawn().unwrap();
+    assert!(a.wait_with_output().unwrap().status.success() && b.wait_with_output().unwrap().status.success());
+    let ka = map.lookup(0x61).unwrap().0;
+    let seq: Vec<bool> = wait_events(&conn, 40, Duration::from_secs(10), |e| matches!(e, Event::KeyPress(_)))
+        .into_iter()
+        .filter_map(|e| if let Event::KeyPress(k) = e { Some(k.detail == ka) } else { None })
+        .collect();
+    assert_eq!(seq.len(), 40);
+    let switches = seq.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(switches, 1, "verbs from two shells interleaved: {seq:?}");
+    // A display that does not answer is an error naming it. (A view taken
+    // of another display is set aside; view.rs tests that.)
+    let (ok, text) = cli.run(&["--display", ":9999", "click", "1", "1"]);
+    assert!(!ok && text.contains(":9999"), "{text}");
+}
+
+/// `record start` leaves a detached recorder that later invocations stamp,
+/// mark and stop; a recorder that died is reported, not hung on.
+#[test]
+fn cli_record_across_processes() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-rec-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    let out = cli.ok(&["--size", "320x240", "record", "start", "--name", "r1", "--fps", "10"]);
+    assert!(out.starts_with("recording ") && out.contains("r1.frames"), "{out}");
+    let pid: i32 = std::fs::read_to_string(cli.state.join("record.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    assert!(alive(pid));
+    let (ok, again) = cli.run(&["record", "start"]);
+    assert!(!ok && again.contains("already recording"), "{again}");
+    cli.ok(&["click", "10", "10"]);
+    cli.ok(&["record", "mark", "after the click"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(cli.ok(&["record", "status"]).starts_with("recording "));
+    let stop = cli.ok(&["record", "stop"]);
+    assert!(stop.contains("finalized=true") && stop.contains("left_click [10, 10]") && stop.contains("mark: after the click"), "{stop}");
+    assert!(stop.contains("contact sheet "), "{stop}");
+    assert!(wait_until(Duration::from_secs(5), || !alive(pid)), "recorder still running after stop");
+    assert!(!cli.state.join("record.pid").exists());
+    let manifest = cli.state.join("recordings/r1.json");
+    assert!(manifest.exists());
+    let (ok, again) = cli.run(&["record", "stop"]);
+    assert!(!ok && again.contains("not recording"), "{again}");
+    let frames = dir.join("frames");
+    cli.ok(&["record", "frames", "--count", "2", "-o", frames.to_str().unwrap()]);
+    assert_eq!(std::fs::read_dir(&frames).unwrap().count(), 2);
+
+    // A recorder killed outright: stop says so instead of waiting.
+    cli.ok(&["record", "start", "--name", "r2"]);
+    let pid: i32 = std::fs::read_to_string(cli.state.join("record.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(wait_until(Duration::from_secs(5), || !alive(pid)));
+    let (ok, died) = cli.run(&["record", "stop"]);
+    assert!(!ok && died.contains("died"), "{died}");
+    // Frames of a cut-off recording: repeated times collapse, names differ.
+    let cut = dir.join("cut");
+    cli.ok(&["record", "frames", "--count", "3", "-o", cut.to_str().unwrap()]);
+    let names: Vec<String> = std::fs::read_dir(&cut).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(!names.is_empty() && names.iter().all(|n| n.starts_with("frame-0")), "{names:?}");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `doctor` never starts a display: with none it says what `up` would start.
+#[test]
+fn doctor_without_a_display_starts_nothing() {
+    let dir = std::env::temp_dir().join(format!("xcua-test-doc-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    let out = cli.ok(&["--size", "800x600", "doctor"]);
+    assert!(out.contains("would start") && out.contains("800x600") && out.contains("unknown until"), "{out}");
+    let j: serde_json::Value = serde_json::from_str(&cli.ok(&["--json", "doctor"])).unwrap();
+    assert!(j["display"].is_null(), "{j}");
+    assert!(cli.env_display().is_none() && cli.pid().is_none(), "doctor started a display");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `up --size` refuses a running display of another size; `--restart`
+/// replaces it.
+#[test]
+fn up_size_mismatch_refuses_then_restarts() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-size-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    cli.ok(&["up", "--size", "320x240"]);
+    let old = cli.pid().unwrap();
+    let (ok, text) = cli.run(&["up", "--size", "400x300"]);
+    assert!(!ok && text.contains("running at 320x240") && text.contains("--restart"), "{text}");
+    assert!(cli.ok(&["up"]).contains("already up"), "no --size: the running one is fine");
+    let out = cli.ok(&["up", "--size", "400x300", "--restart"]);
+    assert!(out.contains("started Xvfb") && out.contains("400x300"), "{out}");
+    assert!(wait_until(Duration::from_secs(15), || !alive(old)), "old Xvfb left running");
+    let shot = dir.join("s.png");
+    cli.ok(&["screenshot", "-o", shot.to_str().unwrap()]);
+    assert_eq!(image::image_dimensions(&shot).unwrap(), (400, 300));
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `up --wm <cmd>` starts a window manager on xcua's display, tracked like
+/// the Xvfb: reported by status, its death reported, stopped by `down`.
+#[test]
+fn up_wm_is_started_reported_and_stopped() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-wm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = dir.join("wm-display.txt");
+    let fake = dir.join("fake-wm.sh");
+    std::fs::write(&fake, format!("#!/bin/sh\necho \"$DISPLAY\" > {}\nexec sleep 300\n", seen.display())).unwrap();
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let cli = Cli::new(dir.join("state"), None);
+    let out = cli.ok(&["up", "--size", "320x240", "--wm", fake.to_str().unwrap()]);
+    assert!(out.contains("started window manager"), "{out}");
+    let wm: i32 = std::fs::read_to_string(cli.state.join("wm.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    assert!(wait_until(Duration::from_secs(5), || seen.exists()));
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), cli.env_display().unwrap(), "WM not on xcua's display");
+    assert!(cli.ok(&["status"]).contains("running; it owns focus"));
+    // A WM that dies is reported, not restarted behind the agent's back.
+    unsafe { libc::kill(wm, libc::SIGKILL) };
+    assert!(wait_until(Duration::from_secs(5), || !alive(wm)));
+    assert!(cli.ok(&["status"]).contains("DIED"));
+    let up = cli.ok(&["up"]);
+    assert!(up.contains("has died"), "{up}");
+    // Started again on request; a restart brings it back; `down` stops
+    // it with the Xvfb.
+    cli.ok(&["up", "--wm", fake.to_str().unwrap()]);
+    let before: i32 = std::fs::read_to_string(cli.state.join("wm.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let out = cli.ok(&["up", "--size", "400x300", "--restart"]);
+    assert!(out.contains("started window manager"), "restart dropped the WM: {out}");
+    assert!(wait_until(Duration::from_secs(5), || !alive(before)), "old WM left running");
+    let wm: i32 = std::fs::read_to_string(cli.state.join("wm.pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let xvfb_pid = cli.pid().unwrap();
+    let down = cli.ok(&["down"]);
+    assert!(down.contains("stopped window manager") && down.contains("stopped Xvfb"), "{down}");
+    assert!(wait_until(Duration::from_secs(5), || !alive(wm) && !alive(xvfb_pid)));
+
+    // --wm auto, when one of the known WMs is installed here.
+    if let Some(name) = xcua::xvfb::find_wm() {
+        let out = cli.ok(&["up", "--size", "320x240", "--wm", "auto"]);
+        assert!(out.contains(&format!("started window manager {name}")), "{out}");
+        let down = cli.ok(&["down"]);
+        assert!(down.contains("stopped window manager"), "{down}");
+    }
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run xcua with a deadline; None if it had to be killed (a hang).
+fn run_within(cli: &Cli, args: &[&str], limit: Duration) -> Option<(bool, String)> {
+    let mut child = cli
+        .cmd()
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if child.try_wait().unwrap().is_some() {
+            let out = child.wait_with_output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return Some((out.status.success(), text));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Under real twm (xcua's generated rc), a new window is placed at once
+/// and screenshots keep answering: twm's default interactive placement
+/// grabs the server until someone clicks.
+#[test]
+fn twm_places_windows_without_grabbing() {
+    if !have_xvfb() || xcua::xvfb::on_path("twm").is_none() {
+        eprintln!("twm or Xvfb missing; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-twm-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    let out = cli.ok(&["up", "--size", "640x480", "--wm", "twm"]);
+    assert!(out.contains("started window manager twm -f "), "{out}");
+    let display = cli.env_display().unwrap();
+    // red_window waits for MapNotify, which interactive placement withholds.
+    let (_conn, _win) = red_window(&display);
+    let shot = dir.join("s.png");
+    let r = run_within(&cli, &["screenshot", "-o", shot.to_str().unwrap()], Duration::from_secs(20));
+    let (ok, text) = r.expect("screenshot hung: the server is grabbed");
+    assert!(ok, "{text}");
+    assert!(cli.ok(&["status"]).contains("running; it owns focus"), "twm exited");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without /proc a recorded WM pid is never signalled: it may be anyone's.
+#[test]
+fn no_proc_never_signals_a_wm_pid() {
+    let have_bwrap = xcua::xvfb::on_path("bwrap").is_some();
+    if !have_xvfb() || !have_bwrap {
+        eprintln!("bwrap or Xvfb missing; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-wmproc-{}", std::process::id()));
+    let mut cli = Cli::new(dir.join("state"), None);
+    cli.wrap = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/proc"].map(String::from).to_vec();
+    cli.ok(&["--size", "320x240", "up"]);
+    // A stale wm.pid naming an unrelated live process.
+    let mut bystander = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(cli.state.join("wm.pid"), format!("{}\n", bystander.id())).unwrap();
+    std::fs::write(cli.state.join("wm.cmd"), "jwm\n").unwrap();
+    let down = cli.ok(&["down"]);
+    assert!(down.contains("forgot window manager"), "{down}");
+    assert!(bystander.try_wait().unwrap().is_none(), "xcua signalled an unrelated process");
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}

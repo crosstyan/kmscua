@@ -119,6 +119,11 @@ impl XBackend {
         self
     }
 
+    /// The screen's size now, in pixels.
+    pub fn screen_size(&self) -> Result<(u32, u32)> {
+        lock(&self.capture).size()
+    }
+
     pub fn display(&self) -> String {
         lock(&self.display).clone()
     }

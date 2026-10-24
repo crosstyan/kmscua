@@ -288,6 +288,14 @@ text: characters outside the keymap are bound to a spare keycode for the request
 only when the picture changed, capped at 200 MB each (`XCUA_RECORD_MAX_MB`), stopped
 when the disk has under 64 MB free, the newest 5 kept.
 
+Without MCP (an agent that can only run shell commands), the same tools are one-shot
+verbs: `xcua screenshot -o s.png --max-side 1280`, `xcua click 640 400`, `xcua type …`,
+`xcua key ctrl+l`, `xcua wait-stable`, `xcua batch '<computer_batch json>'`,
+`xcua record start|mark|stop|frames` (a detached recorder), `--json` on all. Their
+coordinates are pixels of the last `xcua screenshot`, mapped through
+`<state>/view.json` exactly as the MCP tools map them. `skills/xcua/SKILL.md` teaches
+an agent the loop.
+
 Building the static binary: build xcua on its own. A workspace build unifies features,
 so `cua`'s default `atspi` (zbus, D-Bus) would be compiled into xcua too.
 

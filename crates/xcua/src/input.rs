@@ -321,7 +321,7 @@ impl Input {
         if names.is_empty() {
             return f(self);
         }
-        let syms = keysym::parse_combo(names).ok_or_else(|| anyhow!("unknown modifier in {names:?}"))?;
+        let syms = keysym::parse_combo_named(names).map_err(|e| anyhow!(e))?;
         let bound = match self.bind(&syms) {
             Ok(b) => b,
             Err(e) => {
