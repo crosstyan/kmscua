@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 use kmscua_mcp::Backend;
 use kmscua_proto::{Button, CursorInfo, ImageFormat, Rect, Request, ScreenshotInfo, Status};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    ConnectionExt as _, CreateWindowAux, EventMask, WindowClass,
-};
+use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, EventMask, WindowClass};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use xcua::XBackend;
@@ -236,42 +234,371 @@ fn unknown_key_is_an_error_not_ok() {
         .is_err());
 }
 
-/// `$DISPLAY` in the environment must not be used unless `--display env`
-/// asks for it: `up` starts its own Xvfb next to the decoy, `--display :N`
-/// attaches to the one named, and nothing is left running.
+/// The xcua binary against a state dir; `xcua down` on drop, so a failed
+/// assertion does not leak the Xvfb it started.
+struct Cli {
+    state: std::path::PathBuf,
+    display_env: Option<String>,
+}
+
+impl Cli {
+    fn new(state: std::path::PathBuf, display_env: Option<&str>) -> Self {
+        Self { state, display_env: display_env.map(str::to_string) }
+    }
+
+    fn cmd(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_xcua"));
+        c.arg("--state-dir").arg(&self.state);
+        match &self.display_env {
+            Some(d) => c.env("DISPLAY", d),
+            None => c.env_remove("DISPLAY"),
+        };
+        c
+    }
+
+    /// Run to completion; (success, stdout + stderr).
+    fn run(&self, args: &[&str]) -> (bool, String) {
+        let out = self.cmd().args(args).output().expect("run xcua");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text)
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let (ok, text) = self.run(args);
+        assert!(ok, "xcua {args:?}: {text}");
+        text
+    }
+
+    fn env_display(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.state.join("env")).ok()?;
+        text.trim().strip_prefix("export DISPLAY=").map(str::to_string)
+    }
+
+    fn pid(&self) -> Option<i32> {
+        std::fs::read_to_string(self.state.join("xvfb.pid")).ok()?.split_whitespace().next()?.parse().ok()
+    }
+
+    fn mcp(&self, args: &[&str]) -> Mcp {
+        let mut child = self
+            .cmd()
+            .args(args)
+            .arg("mcp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start xcua mcp");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut m = Mcp { child, stdin: Some(stdin), stdout, id: 0 };
+        m.rpc("initialize", serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
+        m.notify("notifications/initialized");
+        m
+    }
+}
+
+impl Drop for Cli {
+    fn drop(&mut self) {
+        let _ = self.cmd().arg("down").output();
+        let _ = std::fs::remove_dir_all(&self.state);
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn wait_until(timeout: Duration, f: impl Fn() -> bool) -> bool {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    f()
+}
+
+/// A JSON-RPC session with `xcua mcp`; killed on drop.
+struct Mcp {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    id: u64,
+}
+
+impl Mcp {
+    fn notify(&mut self, method: &str) {
+        use std::io::Write;
+        let m = serde_json::json!({"jsonrpc": "2.0", "method": method});
+        writeln!(self.stdin.as_mut().unwrap(), "{m}").unwrap();
+    }
+
+    fn rpc(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::{BufRead, Write};
+        self.id += 1;
+        let m = serde_json::json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params});
+        writeln!(self.stdin.as_mut().unwrap(), "{m}").unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(self.stdout.read_line(&mut line).unwrap() > 0, "xcua mcp hung up");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == self.id {
+                return v;
+            }
+        }
+    }
+
+    /// A tool call's text, or "ERR …".
+    fn tool(&mut self, name: &str, args: serde_json::Value) -> String {
+        let r = self.rpc("tools/call", serde_json::json!({"name": name, "arguments": args}));
+        if let Some(e) = r.get("error") {
+            return format!("ERR {e}");
+        }
+        r["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().map(str::to_string).unwrap_or_else(|| format!("<{}>", c["type"].as_str().unwrap_or("?"))))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Close stdin and wait for a clean exit.
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            if let Some(st) = self.child.try_wait().unwrap() {
+                assert!(st.success(), "xcua mcp exited with {st}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("xcua mcp did not exit after stdin closed");
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn have_xvfb() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("Xvfb").is_file()))
+        .unwrap_or(false)
+}
+
+/// `$DISPLAY` in the environment is never used unless `--display env`
+/// asks for it, `--display` on one-shot commands leaves the state alone,
+/// and `up --display` will not hide xcua's own Xvfb.
 #[test]
 fn display_env_is_never_implicit() {
     let Some(decoy) = xvfb("policy") else { return };
-    let bin = env!("CARGO_BIN_EXE_xcua");
-    let state = decoy.dir.join("state");
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new(bin)
-            .arg("--state-dir")
-            .arg(&state)
-            .args(args)
-            .env("DISPLAY", &decoy.display)
-            .output()
-            .expect("run xcua");
-        assert!(out.status.success(), "xcua {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let up = run(&["--size", "320x240", "up"]);
+    let cli = Cli::new(decoy.dir.join("state"), Some(&decoy.display));
+    let up = cli.ok(&["--size", "320x240", "up"]);
     assert!(up.contains("started Xvfb"), "{up}");
-    let env = std::fs::read_to_string(state.join("env")).unwrap();
-    let own = env.trim().strip_prefix("DISPLAY=").unwrap().to_string();
-    assert_ne!(own, decoy.display, "attached to $DISPLAY: {env}");
+    let own = cli.env_display().unwrap();
+    assert_ne!(own, decoy.display, "attached to $DISPLAY");
     let shot = decoy.dir.join("own.png");
-    run(&["screenshot", "-o", shot.to_str().unwrap()]);
+    cli.ok(&["screenshot", "-o", shot.to_str().unwrap()]);
     assert_eq!(image::image_dimensions(&shot).unwrap(), (320, 240), "screenshot came from the decoy");
-    let down = run(&["down"]);
-    assert!(down.contains("stopped Xvfb"), "{down}");
 
-    // Named on purpose: attach, screenshot the decoy, leave it alone.
-    let up = run(&["--display", &decoy.display, "up"]);
-    assert!(up.contains("attached to"), "{up}");
-    run(&["--display", "env", "screenshot", "-o", shot.to_str().unwrap()]);
+    // One-shot --display: used for the run, state untouched.
+    cli.ok(&["--display", "env", "screenshot", "-o", shot.to_str().unwrap()]);
     assert_eq!(image::image_dimensions(&shot).unwrap(), (640, 480));
-    let down = run(&["down"]);
+    cli.ok(&["--display", "env", "doctor"]);
+    assert_eq!(cli.env_display().as_deref(), Some(own.as_str()), "a one-shot --display rewrote the env file");
+    assert!(cli.pid().is_some_and(alive), "a one-shot --display orphaned xcua's Xvfb");
+    // up --display refuses while xcua's own Xvfb runs.
+    let (ok, text) = cli.run(&["--display", &decoy.display, "up"]);
+    assert!(!ok && text.contains("xcua down"), "{text}");
+
+    let down = cli.ok(&["down"]);
+    assert!(down.contains("stopped Xvfb"), "{down}");
+    let up = cli.ok(&["--display", &decoy.display, "up"]);
+    assert!(up.contains("attached to"), "{up}");
+    let down = cli.ok(&["down"]);
     assert!(down.contains("left running"), "{down}");
     assert!(xcua::xvfb::answers(&decoy.display));
+}
+
+/// The entry point that once panicked: `xcua mcp` with `$DISPLAY` set
+/// starts its own Xvfb, serves clicks and screenshots on it, stops it on
+/// exit; with `--display` it attaches and leaves the state dir alone.
+#[test]
+fn mcp_with_display_set_starts_its_own() {
+    let Some(decoy) = xvfb("mcpenv") else { return };
+    let cli = Cli::new(decoy.dir.join("state"), Some(&decoy.display));
+    let mut m = cli.mcp(&["--size", "320x240"]);
+    let own = cli.env_display().unwrap();
+    assert_ne!(own, decoy.display);
+    assert_eq!(m.tool("left_click", serde_json::json!({"coordinate": [100, 100]})), "OK");
+    assert_eq!(m.tool("screenshot", serde_json::json!({})), "<image>");
+    let doctor = m.tool("doctor", serde_json::json!({}));
+    assert!(doctor.contains("320x240") && doctor.contains(&format!("\"{own}\"")), "{doctor}");
+    let pid = cli.pid().unwrap();
+    m.finish();
+    assert!(wait_until(Duration::from_secs(5), || !alive(pid)), "mcp's Xvfb outlived it");
+    assert!(cli.env_display().is_none());
+
+    let mut m = cli.mcp(&["--display", &decoy.display]);
+    let doctor = m.tool("doctor", serde_json::json!({}));
+    assert!(doctor.contains("640x480"), "{doctor}");
+    assert!(cli.env_display().is_none(), "mcp --display wrote the state dir");
+    m.finish();
+    assert!(xcua::xvfb::answers(&decoy.display));
+}
+
+/// Four `xcua up`s at once start one Xvfb between them.
+#[test]
+fn concurrent_up_starts_one_xvfb() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-race-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    let kids: Vec<_> = (0..4)
+        .map(|_| cli.cmd().args(["--size", "320x240", "up"]).stdout(std::process::Stdio::piped()).spawn().unwrap())
+        .collect();
+    let outs: Vec<String> = kids
+        .into_iter()
+        .map(|k| String::from_utf8_lossy(&k.wait_with_output().unwrap().stdout).into_owned())
+        .collect();
+    let started = outs.iter().filter(|o| o.contains("started Xvfb")).count();
+    assert_eq!(started, 1, "{outs:#?}");
+    let display = cli.env_display().unwrap();
+    assert!(outs.iter().all(|o| o.contains(&format!("DISPLAY={display} "))), "{outs:#?}");
+    let leftovers: Vec<_> = std::fs::read_dir(&cli.state)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two `xcua mcp`s share xcua's Xvfb: the first leaving does not stop it
+/// under the second, the last one leaving does. A SIGKILLed starter's Xvfb
+/// is adopted by the next mcp; a vanished Xvfb is started again.
+#[test]
+fn mcp_users_share_adopt_and_reconnect() {
+    if !have_xvfb() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xcua-test-users-{}", std::process::id()));
+    let cli = Cli::new(dir.join("state"), None);
+    let mut a = cli.mcp(&["--size", "320x240"]);
+    let pid = cli.pid().unwrap();
+    let mut b = cli.mcp(&[]);
+    assert_eq!(cli.pid(), Some(pid), "the second mcp started another Xvfb");
+    assert!(cli.ok(&["status"]).contains("mcp users: ["), "{}", cli.ok(&["status"]));
+    assert_eq!(a.tool("screenshot", serde_json::json!({})), "<image>");
+    a.finish();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(alive(pid), "first mcp stopped the Xvfb its peer uses");
+    assert_eq!(b.tool("screenshot", serde_json::json!({})), "<image>");
+
+    // B's starter (A) is gone; SIGKILL B as well: the Xvfb is orphaned.
+    drop(b);
+    assert!(alive(pid));
+    // C adopts it, and stops it when leaving.
+    let mut c = cli.mcp(&[]);
+    assert_eq!(cli.pid(), Some(pid));
+    let status = cli.ok(&["status"]);
+    assert!(status.contains("owner: mcp "), "{status}");
+
+    // Kill the Xvfb under C: the next request reconnects to a new one.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(wait_until(Duration::from_secs(5), || !alive(pid)));
+    assert_eq!(c.tool("screenshot", serde_json::json!({})), "<image>", "no reconnect after the Xvfb died");
+    let new_pid = cli.pid().unwrap();
+    assert_ne!(new_pid, pid);
+    c.finish();
+    assert!(wait_until(Duration::from_secs(5), || !alive(new_pid)), "last mcp did not stop the Xvfb");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed request releases what it pressed, not a button an earlier
+/// `left_mouse_down` holds.
+#[test]
+fn failed_request_keeps_an_earlier_held_button() {
+    let Some(x) = xvfb("held") else { return };
+    let b = backend(&x, false);
+    let (conn, screen) = RustConnection::connect(Some(&x.display)).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let button1 = |c: &RustConnection| u16::from(c.query_pointer(root).unwrap().reply().unwrap().mask) & 0x100 != 0;
+    b.call(&Request::PointerMove { x: 50, y: 50 }).unwrap();
+    b.call(&Request::PointerButton { button: Button::Left, down: true }).unwrap();
+    assert!(button1(&conn));
+    assert!(b.call(&Request::KeyCombo { keys: vec!["ctrl+nosuchkey".into()] }).is_err());
+    assert!(b.call(&Request::Type { text: "ab\u{7}".into(), delay_ms: None }).is_err());
+    assert!(button1(&conn), "a failed request released the held button");
+    b.call(&Request::PointerButton { button: Button::Left, down: false }).unwrap();
+    assert!(!button1(&conn));
+
+    // The mechanism: what the request pressed goes, the rest stays.
+    let mut i = xcua::input::Input::open(&x.display).unwrap();
+    i.button(Button::Left, true).unwrap();
+    let before = i.held();
+    i.key(30, true).unwrap(); // evdev KEY_A
+    i.release_since(&before);
+    let keys = conn.query_keymap().unwrap().reply().unwrap().keys;
+    assert!(keys.iter().all(|&k| k == 0), "key left down: {keys:?}");
+    assert!(button1(&conn));
+    i.button(Button::Left, false).unwrap();
+}
+
+/// Shutdown cuts a long hold_key short and leaves nothing down.
+#[test]
+fn shutdown_cancels_a_hold() {
+    let Some(x) = xvfb("hold") else { return };
+    let b = std::sync::Arc::new(backend(&x, false));
+    let b2 = b.clone();
+    let t0 = Instant::now();
+    let hold = std::thread::spawn(move || b2.call(&Request::KeyHold { keys: vec!["shift".into()], seconds: 30.0 }));
+    std::thread::sleep(Duration::from_millis(300));
+    b.shutdown(Duration::from_secs(2));
+    let r = hold.join().unwrap();
+    assert!(r.is_err(), "hold was not cancelled");
+    assert!(t0.elapsed() < Duration::from_secs(3), "shutdown waited {:?}", t0.elapsed());
+    let (conn, _) = RustConnection::connect(Some(&x.display)).unwrap();
+    let keys = conn.query_keymap().unwrap().reply().unwrap().keys;
+    assert!(keys.iter().all(|&k| k == 0), "keys left down: {keys:?}");
+}
+
+/// Clicking a menu-like override-redirect window does not take the focus.
+#[test]
+fn click_does_not_focus_override_redirect() {
+    let Some(x) = xvfb("override") else { return };
+    let b = backend(&x, false);
+    let (conn, win) = red_window(&x.display);
+    b.call(&Request::Click { x: 200, y: 175, button: Button::Left, count: 1, modifiers: vec![] }).unwrap();
+    assert_eq!(conn.get_input_focus().unwrap().reply().unwrap().focus, win);
+    let root = conn.setup().roots[0].root;
+    let menu = conn.generate_id().unwrap();
+    conn.create_window(
+        0,
+        menu,
+        root,
+        400,
+        300,
+        100,
+        100,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new().background_pixel(0x00ff00).override_redirect(1),
+    )
+    .unwrap();
+    conn.map_window(menu).unwrap();
+    conn.get_input_focus().unwrap().reply().unwrap();
+    b.call(&Request::Click { x: 450, y: 350, button: Button::Left, count: 1, modifiers: vec![] }).unwrap();
+    assert_eq!(conn.get_input_focus().unwrap().reply().unwrap().focus, win, "focus went to the override-redirect window");
 }

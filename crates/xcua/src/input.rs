@@ -2,8 +2,13 @@
 //! (buttons 4-7) and keys, with cuad's timings and cuad's atomicity.
 //!
 //! Every public method releases whatever it pressed before it returns,
-//! including on error; `Backend` adds a `release_all` on top when a request
-//! fails. A keysym the keyboard map does not hold is bound to a spare
+//! including on error. The keys and buttons down are tracked, so when a
+//! request fails `Backend` releases exactly what that request pressed
+//! ([`Input::held`], [`Input::release_since`]) and a button held by an
+//! earlier `left_mouse_down` stays held, as on cuad. [`Input::release_all`]
+//! is for a panic and for exit. Holds, typing and drags sleep in short
+//! slices and stop when the cancel flag is raised, so a shutdown does not
+//! wait out a 100 s `hold_key`. A keysym the keyboard map does not hold is bound to a spare
 //! keycode for the request and unbound before it answers (xdotool's trick),
 //! so any Unicode character can be typed whatever the layout.
 //!
@@ -13,9 +18,11 @@
 //! window under the pointer, the way a click-to-focus WM does, unless a
 //! window manager is running, in which case focus is its business.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kmscua_proto::{Button, Rect};
@@ -35,6 +42,18 @@ pub struct Input {
     tap_ms: u64,
     /// Spare keycodes currently bound by us, to unbind on any exit path.
     borrowed: Vec<u8>,
+    /// Keycodes and buttons we pressed and have not released.
+    down_keys: BTreeSet<u8>,
+    down_buttons: BTreeSet<u8>,
+    /// Raised at shutdown: long sleeps end early with an error.
+    cancel: Arc<AtomicBool>,
+}
+
+/// What was down before a request, for [`Input::release_since`].
+#[derive(Clone, Debug, Default)]
+pub struct Held {
+    keys: BTreeSet<u8>,
+    buttons: BTreeSet<u8>,
 }
 
 /// Keysyms resolved for one request: `(keycode, shift)` each.
@@ -50,7 +69,62 @@ impl Input {
         }
         conn.xtest_get_version(2, 2)?.reply().context("XTEST GetVersion")?;
         x11::root_size(&conn, root, display)?;
-        Ok(Self { conn, root, display: display.to_string(), tap_ms: 30, borrowed: Vec::new() })
+        Ok(Self {
+            conn,
+            root,
+            display: display.to_string(),
+            tap_ms: 30,
+            borrowed: Vec::new(),
+            down_keys: BTreeSet::new(),
+            down_buttons: BTreeSet::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// The flag that cuts holds, typing and drags short; shared with the
+    /// signal handler, which must not wait for the input lock to raise it.
+    pub fn canceller(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Use `cancel` as this input's flag (kept across a reconnect).
+    pub fn set_canceller(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = cancel;
+    }
+
+    /// Sleep `d` in slices, failing as soon as the cancel flag is up.
+    fn pause(&self, d: Duration) -> Result<()> {
+        let end = Instant::now() + d;
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                bail!("cancelled: xcua is shutting down");
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            sleep(left.min(Duration::from_millis(25)));
+        }
+    }
+
+    /// What is down now (pressed by us and not released).
+    pub fn held(&self) -> Held {
+        Held { keys: self.down_keys.clone(), buttons: self.down_buttons.clone() }
+    }
+
+    /// Release what was pressed since `before` and unbind borrowed
+    /// keycodes, leaving down whatever was already down then.
+    pub fn release_since(&mut self, before: &Held) {
+        let keys: Vec<u8> = self.down_keys.difference(&before.keys).copied().collect();
+        for kc in keys.into_iter().rev() {
+            let _ = self.key_code(kc, false);
+        }
+        let buttons: Vec<u8> = self.down_buttons.difference(&before.buttons).copied().collect();
+        for b in buttons {
+            let _ = self.press(b, false);
+        }
+        self.unbind();
+        let _ = self.sync();
     }
 
     pub fn conn(&self) -> &RustConnection {
@@ -78,6 +152,11 @@ impl Input {
             log::trace!("drained {ev:?}");
         }
         Ok(())
+    }
+
+    /// Whether the connection still answers a round trip.
+    pub fn alive(&self) -> bool {
+        self.conn.get_input_focus().is_ok_and(|c| c.reply().is_ok())
     }
 
     pub fn keymap(&self) -> Result<KeyMap> {
@@ -114,6 +193,17 @@ impl Input {
         if child == x11rb::NONE {
             return;
         }
+        // Menus and tooltips are override-redirect: focusing one would take
+        // the keyboard from the window that opened it.
+        let override_redirect = self
+            .conn
+            .get_window_attributes(child)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_none_or(|a| a.override_redirect);
+        if override_redirect {
+            return;
+        }
         let r = self
             .conn
             .set_input_focus(InputFocus::POINTER_ROOT, child, x11rb::CURRENT_TIME)
@@ -124,9 +214,15 @@ impl Input {
         }
     }
 
-    fn press(&self, button: u8, down: bool) -> Result<()> {
+    fn press(&mut self, button: u8, down: bool) -> Result<()> {
         let t = if down { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT };
-        self.fake(t, button, 0, 0)
+        self.fake(t, button, 0, 0)?;
+        if down {
+            self.down_buttons.insert(button);
+        } else {
+            self.down_buttons.remove(&button);
+        }
+        Ok(())
     }
 
     pub fn button(&mut self, button: Button, down: bool) -> Result<()> {
@@ -208,9 +304,15 @@ impl Input {
         let _ = self.sync();
     }
 
-    fn key_code(&self, kc: u8, down: bool) -> Result<()> {
+    fn key_code(&mut self, kc: u8, down: bool) -> Result<()> {
         let t = if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
-        self.fake(t, kc, 0, 0)
+        self.fake(t, kc, 0, 0)?;
+        if down {
+            self.down_keys.insert(kc);
+        } else {
+            self.down_keys.remove(&kc);
+        }
+        Ok(())
     }
 
     /// Press the named keys, run `f`, release them in reverse. The release
@@ -254,10 +356,7 @@ impl Input {
     /// Hold a chord for `seconds`, then release. Bounded to 100 s.
     pub fn hold(&mut self, keys: &[String], seconds: f32) -> Result<()> {
         let secs = seconds.clamp(0.0, 100.0);
-        self.with_modifiers(keys, |_| {
-            sleep(Duration::from_secs_f32(secs));
-            Ok(())
-        })
+        self.with_modifiers(keys, |i| i.pause(Duration::from_secs_f32(secs)))
     }
 
     pub fn click(&mut self, x: i32, y: i32, button: Button, count: u32) -> Result<()> {
@@ -288,11 +387,10 @@ impl Input {
         for i in 1..=steps {
             let x = from.0 + (to.0 - from.0) * i / steps;
             let y = from.1 + (to.1 - from.1) * i / steps;
-            if let Err(e) = self.move_to(x, y) {
+            if let Err(e) = self.move_to(x, y).and_then(|_| self.pause(Duration::from_millis(8))) {
                 result = Err(e);
                 break;
             }
-            sleep(Duration::from_millis(8));
         }
         sleep(Duration::from_millis(60));
         let release = self.press(code, false);
@@ -392,7 +490,7 @@ impl Input {
                 let _ = self.key_code(shift.unwrap(), false);
             }
             r?;
-            sleep(delay);
+            self.pause(delay)?;
         }
         self.sync()
     }
@@ -429,6 +527,8 @@ impl Input {
                 }
             }
         }
+        self.down_keys.clear();
+        self.down_buttons.clear();
         self.unbind();
         let _ = self.sync();
     }

@@ -210,22 +210,50 @@ static musl binary, for agent cells with no GPU, DRM, uinput or listening ports,
 bwrap sandboxes.
 
 ```
-xcua up [--size 1920x1080]          # start Xvfb (or reuse xcua's); writes DISPLAY=:N to the env file
+xcua up [--size 1920x1080]          # start Xvfb (or reuse xcua's); writes `export DISPLAY=:N` to the env file
 . ~/.local/state/xcua/env && xterm & # apps the agent starts read the env file
 claude mcp add xcua -- xcua mcp      # auto-ups if xcua's Xvfb is not running
 xcua screenshot -o shot.png | doctor | status | down
-xcua --display :1 doctor             # an existing server, named on purpose; `--display env` = $DISPLAY
+xcua --display :1 doctor             # an existing server for this run only; `--display env` = $DISPLAY
+xcua --display :1 up                 # record :1 as the display to use, until `xcua down`
 ```
 
 `xcua` never uses the shell's `$DISPLAY` on its own: without `--display` every command
 uses xcua's own Xvfb, starting one when needed, so an agent cannot land on the user's
-screen because a shell exported it. An Xvfb started by `xcua up` (or by `screenshot` or
-`doctor`) stays until `xcua down`; one that `xcua mcp` had to start stops when that
-`mcp` exits. State (env file, pidfile, owner, Xvfb log, recordings) lives in
-`--state-dir`, default `$XDG_STATE_HOME/xcua`. With no window manager, every
-click gives the window under the pointer the keyboard. `type` takes any Unicode text:
-characters outside the keymap are bound to a spare keycode for the request (xdotool's
-trick), so no clipboard tool is needed. Recordings are JPEG stills, not MP4.
+screen because a shell exported it. `--display` on any command but `up` is for that run
+only and leaves the state dir alone; `up --display` records the attach, and refuses
+while xcua's own Xvfb runs. An Xvfb started by `xcua up` (or by `screenshot` or
+`doctor`) stays until `xcua down`. One that `xcua mcp` started is shared by every `mcp`
+that finds it and stops when the last one leaves; an `mcp` killed with SIGKILL is
+pruned by the next, which adopts the Xvfb. If the Xvfb dies under a running `mcp`, the
+next request starts or finds one again and retries once. A lock in the state dir
+serializes all of this, so concurrent `xcua up`s start one Xvfb. State (env file,
+pidfile with the Xvfb's start time, owner, users, Xvfb log, recordings) lives in
+`--state-dir`, default `$XDG_STATE_HOME/xcua`.
+
+With no window manager, every click gives the top-level window under the pointer the
+keyboard (menus and other override-redirect windows excepted). `type` takes any Unicode
+text: characters outside the keymap are bound to a spare keycode for the request
+(xdotool's trick), so no clipboard tool is needed. Recordings are JPEG stills, written
+only when the picture changed, capped at 200 MB each (`XCUA_RECORD_MAX_MB`), stopped
+when the disk has under 64 MB free, the newest 5 kept.
+
+Building the static binary: build xcua on its own. A workspace build unifies features,
+so `cua`'s default `atspi` (zbus, D-Bus) would be compiled into xcua too.
+
+```
+rustup target add x86_64-unknown-linux-musl
+cargo build -p xcua --release --target x86_64-unknown-linux-musl
+# target/x86_64-unknown-linux-musl/release/xcua: static-pie, about 7 MB stripped
+```
+
+Xvfb itself must be installed (`apt install xvfb`, `pacman -S xorg-server-xvfb`); xcua
+does not bundle it. Without root, one way on Debian or Ubuntu is to unpack the packages
+into the persistent directory: `apt-get download xvfb xserver-common x11-xkb-utils`
+plus the libraries `ldd Xvfb` reports missing, then `dpkg -x <deb> ~/opt/xvfb` for each,
+and put `~/opt/xvfb/usr/bin` on `PATH` and its lib directories on `LD_LIBRARY_PATH`.
+Xvfb runs `xkbcomp` to build its keymap; if it fails to start, `xvfb.log` in the state
+dir says why. (Not tested in a cell here.)
 
 ## Limitations
 
@@ -237,18 +265,20 @@ trick), so no clipboard tool is needed. Recordings are JPEG stills, not MP4.
   element tree. GTK, Qt and VTE answer well, Electron needs its accessibility flag,
   Flutter, GL and video answer with nothing useful. AT-SPI positions on Wayland are
   window-relative and cannot be mapped to the screenshot, so they are not reported.
-- **X11 is not the target.** It works there too (the scanout is below X), but X11 already
-  has `xdotool`, `xwd`, `wmctrl` and XTEST with window awareness; kmscua brings nothing
-  they lack. Use it on X11 only if you want one tool across both.
+- **X11 is not cuad's target.** It works there too (the scanout is below X), but X11
+  already has `xdotool`, `xwd`, `wmctrl` and XTEST with window awareness; cuad brings
+  nothing they lack. Where X is all there is (a sandbox with no GPU), use `xcua`.
 - **Needs a KMS scanout.** Root or `CAP_SYS_ADMIN`, an active CRTC on a DRM card.
   Headless works through `vkms` (see Virtual desktop); no VM guests whose scanout is
   host-rendered (virgl), no nested compositors, no remote sessions. A blanked output
   captures black; `cua wake` nudges it.
 - **One CRTC per screenshot.** Multi-monitor is not stitched yet; the input range already
   spans all displays.
-- **Keyboard layout is US.** ASCII is typed through the virtual keyboard; anything else
-  goes through the clipboard, which needs the session's Wayland or X socket to be
-  discoverable from `/proc` (it is, from an SSH shell, for the same uid).
+- **cuad's keyboard layout is US.** ASCII is typed through the virtual keyboard;
+  anything else goes through the clipboard, which needs the session's Wayland or X
+  socket to be discoverable from `/proc` (it is, from an SSH shell, for the same uid).
+  xcua has neither limit: it reads the X server's own keymap and binds a spare keycode
+  for any character the layout lacks.
 - **Compositor shortcuts win.** Super, Alt+Tab and friends are handled by the compositor
   before any app sees them, the same as for a physical keyboard.
 - **Cursor position is approximate on Tegra.** libdrmtap reports a zero hotspot there,

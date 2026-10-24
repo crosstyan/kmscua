@@ -3,20 +3,28 @@
 //!
 //! Capture and input hold one connection each, so a recording's grabs never
 //! queue behind a key hold. Input requests run one at a time under a lock
-//! (cuad's request thread); a failed one releases everything before the
-//! error goes back. Every reply is shaped as cuad shapes it, so the MCP
-//! layer's coordinate view and timeline work unchanged.
+//! (cuad's request thread); a failed one releases what it pressed before
+//! the error goes back, and leaves down what an earlier request (a
+//! `left_mouse_down`) holds. Every reply is shaped as cuad shapes it, so
+//! the MCP layer's coordinate view and timeline work unchanged.
 //!
 //! Nothing here may take the server down with it: a lock whose holder
 //! panicked is taken over rather than left poisoned, and a panic inside a
-//! request comes back as an `Err` after everything is released.
+//! request comes back as an `Err` after everything is released, inside the
+//! input lock so no other request sees keys left down.
+//!
+//! When the X server goes away (another `xcua mcp` stopped the Xvfb, it
+//! crashed), a failed request finds its connections dead, reconnects once,
+//! through the re-up hook when there is one so a new Xvfb is started, and
+//! retries; if that fails too the error names both causes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use kmscua_mcp::Backend;
 use kmscua_proto::{Header, RecordInfo, Reply, Request, Status};
 use serde_json::json;
@@ -36,10 +44,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "panic without a message".into())
+}
+
+/// Starts or finds a display again after the X connection died; answers
+/// the display to reconnect to.
+pub type Reup = Box<dyn Fn() -> Result<String> + Send + Sync>;
+
 pub struct XBackend {
-    display: String,
+    display: Mutex<String>,
+    shm: bool,
     capture: Arc<Mutex<Capture>>,
     input: Mutex<Input>,
+    /// Shared with every `Input`: raised at shutdown to cut holds short.
+    cancel: Arc<AtomicBool>,
+    reup: Option<Reup>,
     rec: Mutex<RecSlot>,
     record_dir: PathBuf,
     started: Instant,
@@ -58,10 +82,14 @@ impl XBackend {
     pub fn open(display: &str, shm: bool, record_dir: &Path) -> Result<Self> {
         let capture = Capture::open(display, shm)?;
         let input = Input::open(display)?;
+        let cancel = input.canceller();
         Ok(Self {
-            display: display.to_string(),
+            display: Mutex::new(display.to_string()),
+            shm,
             capture: Arc::new(Mutex::new(capture)),
             input: Mutex::new(input),
+            cancel,
+            reup: None,
             rec: Mutex::new(RecSlot::default()),
             record_dir: record_dir.to_path_buf(),
             started: Instant::now(),
@@ -69,8 +97,15 @@ impl XBackend {
         })
     }
 
-    pub fn display(&self) -> &str {
-        &self.display
+    /// Use `reup` to get a display back when the X connection dies; without
+    /// it the backend reconnects to the same display.
+    pub fn with_reup(mut self, reup: Reup) -> Self {
+        self.reup = Some(reup);
+        self
+    }
+
+    pub fn display(&self) -> String {
+        lock(&self.display).clone()
     }
 
     /// Release every key and button and unbind borrowed keycodes.
@@ -78,18 +113,80 @@ impl XBackend {
         lock(&self.input).release_all();
     }
 
+    /// Shutdown: cut any hold, drag or typing short, wait at most `within`
+    /// for the request running to give the input lock back, then release
+    /// everything. Gives up (and says so in the log) rather than hang.
+    pub fn shutdown(&self, within: Duration) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + within;
+        loop {
+            match self.input.try_lock() {
+                Ok(mut i) => return i.release_all(),
+                Err(TryLockError::Poisoned(p)) => return p.into_inner().release_all(),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(TryLockError::WouldBlock) => {
+                    log::warn!("input still busy after {within:?} at shutdown; not releasing");
+                    return;
+                }
+            }
+        }
+    }
+
     /// The capture behind a lock, for the recorder thread and the CLI.
     pub fn capture(&self) -> Arc<Mutex<Capture>> {
         self.capture.clone()
     }
 
+    /// Run an input request under the lock. On error release what it
+    /// pressed; on panic release everything, both before the lock is given
+    /// back.
     fn input<T>(&self, f: impl FnOnce(&mut Input) -> Result<T>) -> Result<T> {
         let mut i = lock(&self.input);
-        let r = f(&mut i);
-        if r.is_err() {
-            i.release_all();
+        let before = i.held();
+        match catch_unwind(AssertUnwindSafe(|| f(&mut i))) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                i.release_since(&before);
+                Err(e)
+            }
+            Err(p) => {
+                i.release_all();
+                bail!("internal: {}", panic_message(p))
+            }
         }
-        r
+    }
+
+    /// Both connections answer a round trip.
+    fn connected(&self) -> bool {
+        lock(&self.input).alive() && lock(&self.capture).alive()
+    }
+
+    /// New connections to the display the re-up hook answers (or the same
+    /// one), swapped in behind the locks so the recorder follows.
+    fn reconnect(&self) -> Result<String> {
+        let d = match &self.reup {
+            Some(f) => f().context("re-up")?,
+            None => self.display(),
+        };
+        let cap = Capture::open(&d, self.shm)?;
+        let mut inp = Input::open(&d)?;
+        inp.set_canceller(self.cancel.clone());
+        *lock(&self.capture) = cap;
+        *lock(&self.input) = inp;
+        *lock(&self.display) = d.clone();
+        log::warn!("reconnected to X display {d}");
+        Ok(d)
+    }
+
+    /// `dispatch` with panics turned into errors.
+    fn call_once(&self, req: &Request) -> Result<(serde_json::Value, Vec<u8>)> {
+        match catch_unwind(AssertUnwindSafe(|| self.dispatch(req))) {
+            Ok(r) => r,
+            Err(p) => {
+                self.release_all();
+                bail!("internal: {}", panic_message(p))
+            }
+        }
     }
 
     fn status(&self) -> Result<Status> {
@@ -226,6 +323,7 @@ impl XBackend {
                     max_side: *max_side,
                     max_seconds: *max_seconds,
                     cursor: *cursor,
+                    ..Default::default()
                 };
                 (serde_json::to_value(self.record_start(opts)?)?, empty)
             }
@@ -262,7 +360,7 @@ impl XBackend {
             (c.size().ok(), c.shm_active())
         };
         json!({
-            "display": self.display,
+            "display": self.display(),
             "size": size.map(|(w, h)| format!("{w}x{h}")),
             "extensions": extensions,
             "capture": if shm { "MIT-SHM" } else { "GetImage" },
@@ -280,21 +378,18 @@ impl XBackend {
 impl Backend for XBackend {
     fn call(&self, req: &Request) -> Result<Reply> {
         self.served.fetch_add(1, Ordering::Relaxed);
-        // Last line: a panic anywhere below becomes this request's error,
-        // with nothing left pressed, instead of a dead task and a poisoned
-        // server. The locks are reacquired with `lock`, so the state stays
-        // reachable.
-        let (data, payload) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch(req))) {
-            Ok(r) => r?,
-            Err(payload) => {
-                let msg = payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "panic without a message".into());
-                self.release_all();
-                bail!("internal: {msg}");
+        let (data, payload) = match self.call_once(req) {
+            Ok(r) => r,
+            Err(e) if !self.connected() => {
+                let lost = self.display();
+                match self.reconnect() {
+                    Ok(d) => self
+                        .call_once(req)
+                        .with_context(|| format!("X connection to {lost} was lost ({e:#}); retried on {d}"))?,
+                    Err(re) => bail!("X connection to {lost} was lost ({e:#}) and reconnecting failed: {re:#}"),
+                }
             }
+            Err(e) => return Err(e),
         };
         Ok(Reply {
             header: Header { ok: true, error: None, data, bytes: payload.len() as u64 },

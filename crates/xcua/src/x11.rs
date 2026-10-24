@@ -247,6 +247,11 @@ impl Capture {
         Ok(cap)
     }
 
+    /// Whether the connection still answers a round trip.
+    pub fn alive(&self) -> bool {
+        self.conn.get_input_focus().is_ok_and(|c| c.reply().is_ok())
+    }
+
     pub fn cursor_supported(&self) -> bool {
         self.xfixes
     }
