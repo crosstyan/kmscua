@@ -739,6 +739,167 @@ fn client_of(conn: &RustConnection, top: Window) -> Window {
     top
 }
 
+/// An application window as `wait-window` and `maximize` see it: the
+/// client (the window with the app's properties, inside a WM's frame if
+/// there is one) and where it is on the screen.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppWindow {
+    /// The child of root (a WM's frame, or the client itself).
+    pub top: Window,
+    pub client: Window,
+    pub name: Option<String>,
+    /// WM_CLASS: instance, then class.
+    pub class: Vec<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl AppWindow {
+    /// Case-insensitive substring match on the title and on either part
+    /// of WM_CLASS; a missing filter matches anything.
+    pub fn matches(&self, name: Option<&str>, class: Option<&str>) -> bool {
+        let has = |hay: &str, needle: &str| hay.to_lowercase().contains(&needle.to_lowercase());
+        name.is_none_or(|n| self.name.as_deref().is_some_and(|t| has(t, n)))
+            && class.is_none_or(|c| self.class.iter().any(|k| has(k, c)))
+    }
+
+    pub fn rect(&self) -> Rect {
+        Rect { x: self.x, y: self.y, width: self.width, height: self.height }
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "{:#x} \"{}\" class {} at {}x{}+{}+{}",
+            self.client,
+            self.name.as_deref().unwrap_or(""),
+            if self.class.is_empty() { "(none)".to_string() } else { self.class.join("/") },
+            self.width,
+            self.height,
+            self.x,
+            self.y
+        )
+    }
+}
+
+fn title(conn: &RustConnection, w: Window) -> Option<String> {
+    let utf8 = intern(conn, "UTF8_STRING").ok()?;
+    let net_name = intern(conn, "_NET_WM_NAME").ok()?;
+    property(conn, w, net_name, utf8)
+        .or_else(|| property(conn, w, AtomEnum::WM_NAME.into(), AtomEnum::ANY.into()))
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+}
+
+fn class_of(conn: &RustConnection, w: Window) -> Vec<String> {
+    property(conn, w, AtomEnum::WM_CLASS.into(), AtomEnum::STRING.into())
+        .map(|v| v.split(|&b| b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// `client` as an [`AppWindow`] (geometry in root coordinates).
+pub fn app_window(conn: &RustConnection, root: Window, top: Window, client: Window) -> Option<AppWindow> {
+    let g = conn.get_geometry(client).ok()?.reply().ok()?;
+    let at = conn.translate_coordinates(client, root, 0, 0).ok()?.reply().ok()?;
+    Some(AppWindow {
+        top,
+        client,
+        name: title(conn, client),
+        class: class_of(conn, client),
+        x: at.dst_x as i32,
+        y: at.dst_y as i32,
+        width: g.width as u32,
+        height: g.height as u32,
+    })
+}
+
+/// Every mapped application window, bottom to top: viewable children of
+/// root that are not override-redirect (menus, tooltips) and carry a title
+/// or a class on their client.
+pub fn app_windows(conn: &RustConnection, root: Window) -> Vec<AppWindow> {
+    let Some(tree) = conn.query_tree(root).ok().and_then(|c| c.reply().ok()) else { return Vec::new() };
+    tree.children
+        .into_iter()
+        .filter(|&w| {
+            conn.get_window_attributes(w)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some_and(|a| a.map_state == xproto::MapState::VIEWABLE && !a.override_redirect)
+        })
+        .filter_map(|top| app_window(conn, root, top, client_of(conn, top)))
+        .filter(|w| w.name.is_some() || !w.class.is_empty())
+        .collect()
+}
+
+/// The application window that has the keyboard, if any.
+pub fn focused_app(conn: &RustConnection, root: Window) -> Option<AppWindow> {
+    let active = intern(conn, "_NET_ACTIVE_WINDOW")
+        .ok()
+        .and_then(|a| property32(conn, root, a, AtomEnum::WINDOW.into()))
+        .filter(|&w| w != 0);
+    let focus = match active {
+        Some(w) => w,
+        None => conn.get_input_focus().ok()?.reply().ok()?.focus,
+    };
+    if focus <= 1 || focus == root {
+        return None;
+    }
+    let top = toplevel(conn, root, focus).ok()?;
+    app_window(conn, root, top, client_of(conn, top))
+}
+
+/// Whether `rgba` is one colour (every pixel within a few levels of the
+/// first): a window the app has not drawn into yet.
+pub fn uniform(rgba: &[u8]) -> bool {
+    let Some(first) = rgba.get(..4) else { return true };
+    let differ = rgba
+        .chunks_exact(4)
+        .filter(|p| (0..3).map(|i| (p[i] as i32 - first[i] as i32).abs()).sum::<i32>() > 24)
+        .count();
+    // A few stray pixels (a cursor, a 1 px border) do not make a page.
+    differ * 1000 < rgba.len() / 4
+}
+
+/// Make `w` fill the screen. With a WM, ask it through
+/// `_NET_WM_STATE_MAXIMIZED_{HORZ,VERT}`; if it ignores that (twm has no
+/// EWMH) or there is none, configure the window to the root size at 0,0.
+/// Answers how it was done.
+pub fn maximize(conn: &RustConnection, root: Window, w: &AppWindow) -> Result<&'static str> {
+    let rg = conn.get_geometry(root)?.reply()?;
+    let full = |a: &AppWindow| a.width >= rg.width as u32 * 95 / 100 && a.height >= rg.height as u32 * 90 / 100;
+    if has_wm(conn, root) {
+        let state = intern(conn, "_NET_WM_STATE")?;
+        let horz = intern(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?;
+        let vert = intern(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?;
+        // _NET_WM_STATE_ADD = 1, source indication 1 = application.
+        let ev = xproto::ClientMessageEvent::new(32, w.client, state, [1, horz, vert, 1, 0]);
+        conn.send_event(
+            false,
+            root,
+            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        )?
+        .check()?;
+        let end = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+            if app_window(conn, root, w.top, w.client).is_some_and(|a| full(&a)) {
+                return Ok("_NET_WM_STATE maximized");
+            }
+        }
+    }
+    let aux = xproto::ConfigureWindowAux::new().x(0).y(0).width(rg.width as u32).height(rg.height as u32);
+    conn.configure_window(w.client, &aux)?.check().context("ConfigureWindow")?;
+    let end = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        if app_window(conn, root, w.top, w.client).is_some_and(|a| full(&a)) {
+            return Ok("resized to the screen");
+        }
+    }
+    bail!("{} did not change size (the window manager may not allow it)", w.summary())
+}
+
 /// Title, class, pid and geometry of `w`, one per line.
 pub fn describe(conn: &RustConnection, root: Window, w: Window) -> String {
     let mut out = String::new();

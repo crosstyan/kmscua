@@ -94,6 +94,8 @@ pub struct CuaServer {
     max_side: u32,
     /// Server name and instructions sent at `initialize`.
     identity: Arc<(String, String)>,
+    /// Server version at `initialize`; None = this crate's build stamp.
+    version: Option<Arc<str>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -751,6 +753,7 @@ impl CuaServer {
             hand: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
             identity: Arc::new((DEFAULT_NAME.to_string(), DEFAULT_INSTRUCTIONS.to_string())),
+            version: None,
             tool_router,
         }
     }
@@ -770,6 +773,12 @@ impl CuaServer {
     /// Present the server under another name and instructions than cua's.
     pub fn with_identity(mut self, name: impl Into<String>, instructions: impl Into<String>) -> Self {
         self.identity = Arc::new((name.into(), instructions.into()));
+        self
+    }
+
+    /// Report another version at `initialize` (the embedding binary's own).
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(Arc::from(version.into()));
         self
     }
 
@@ -1264,7 +1273,10 @@ impl CuaServer {
 impl ServerHandler for CuaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(self.identity.0.clone(), env!("KMSCUA_BUILD")))
+            .with_server_info(Implementation::new(
+                self.identity.0.clone(),
+                self.version.as_deref().unwrap_or(env!("KMSCUA_BUILD")).to_string(),
+            ))
             .with_instructions(self.identity.1.clone())
     }
 }
@@ -1283,6 +1295,8 @@ pub struct ServeOptions {
     /// `(tool, description)` pairs replacing cua's tool descriptions; empty
     /// keeps them all.
     pub descriptions: Vec<(String, String)>,
+    /// Server version at `initialize`; None = cua's build stamp.
+    pub version: Option<String>,
 }
 
 /// Serve the tools on stdio with `backend` answering the requests, until
@@ -1295,6 +1309,9 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>, opts: ServeOptions) -> anyho
         server = server.with_identity(name, instructions);
     }
     server = server.with_descriptions(opts.descriptions.iter().map(|(n, d)| (n.as_str(), d.as_str())));
+    if let Some(v) = opts.version {
+        server = server.with_version(v);
+    }
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

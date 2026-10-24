@@ -253,6 +253,7 @@ impl Input {
         if missing.is_empty() {
             return Ok(Bound { codes });
         }
+        let missing_count = missing.len();
         let mut spare = map.spare();
         if spare.len() < missing.len() {
             bail!(
@@ -275,9 +276,11 @@ impl Input {
             self.borrowed.push(kc);
             codes.insert(s, (kc, false));
         }
-        // Clients reread the map on MappingNotify, which reaches them before
-        // the key events that follow; the pause covers toolkits that refresh
+        // Every client gets a MappingNotify for each change, ours included:
+        // once ours is here the server has sent them all, ahead of the key
+        // events that follow. The pause then covers toolkits that refresh
         // their XKB state lazily.
+        self.await_mapping_notify(missing_count);
         sleep(Duration::from_millis(20));
         Ok(Bound { codes })
     }
@@ -302,6 +305,48 @@ impl Input {
             }
         }
         let _ = self.sync();
+    }
+
+    /// Wait (at most 250 ms) for `n` MappingNotify events on our own
+    /// connection, after a round trip that makes the server process our
+    /// ChangeKeyboardMapping requests.
+    fn await_mapping_notify(&self, n: usize) {
+        let _ = self.conn.get_input_focus().map(|c| c.reply());
+        let end = Instant::now() + Duration::from_millis(250);
+        let mut seen = 0;
+        while seen < n && Instant::now() < end {
+            match self.conn.poll_for_event() {
+                Ok(Some(x11rb::protocol::Event::MappingNotify(_))) => seen += 1,
+                Ok(Some(_)) => {}
+                Ok(None) => sleep(Duration::from_millis(5)),
+                Err(_) => return,
+            }
+        }
+        if seen < n {
+            log::debug!("saw {seen} of {n} MappingNotify events");
+        }
+    }
+
+    /// Wait until the input focus has stayed on one window for 150 ms (at
+    /// most 500 ms in all). A click hands the keyboard over asynchronously:
+    /// a window manager's click-to-focus, an app moving focus into its
+    /// text field. Keys sent before that land in the old window, which is
+    /// how a `type` right after a click loses all but its first letters.
+    fn settle_focus(&self) {
+        let focus = || self.conn.get_input_focus().ok().and_then(|c| c.reply().ok()).map(|r| r.focus);
+        let end = Instant::now() + Duration::from_millis(500);
+        let mut last = focus();
+        let mut since = Instant::now();
+        while Instant::now() < end {
+            sleep(Duration::from_millis(25));
+            let now = focus();
+            if now != last {
+                last = now;
+                since = Instant::now();
+            } else if since.elapsed() >= Duration::from_millis(150) {
+                return;
+            }
+        }
     }
 
     fn key_code(&mut self, kc: u8, down: bool) -> Result<()> {
@@ -444,6 +489,7 @@ impl Input {
     /// in chunks as large as the free keycodes allow.
     pub fn type_text(&mut self, text: &str, delay_ms: u32) -> Result<()> {
         let delay = Duration::from_millis(delay_ms.max(4) as u64);
+        self.settle_focus();
         let mut syms = Vec::with_capacity(text.len());
         for (i, ch) in text.chars().enumerate() {
             syms.push(keysym::char_to_keysym(ch).ok_or_else(|| anyhow!("cannot type control character {ch:?} at index {i}"))?);

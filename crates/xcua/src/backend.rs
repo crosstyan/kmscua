@@ -119,6 +119,13 @@ impl XBackend {
         self
     }
 
+    /// Run `f` on the input connection and its root (window queries and
+    /// requests that are not input events).
+    pub fn with_x<T>(&self, f: impl FnOnce(&x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::Window) -> T) -> T {
+        let i = lock(&self.input);
+        f(i.conn(), i.root())
+    }
+
     /// The screen's size now, in pixels.
     pub fn screen_size(&self) -> Result<(u32, u32)> {
         lock(&self.capture).size()

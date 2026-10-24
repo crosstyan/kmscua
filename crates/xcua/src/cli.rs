@@ -169,7 +169,13 @@ impl Ctx {
     }
 
     pub fn type_text(&self, text: &str) -> Result<Out> {
-        kmscua_mcp::type_text(&self.backend, text)?;
+        self.type_slowly(text, 12)
+    }
+
+    /// Type with `delay_ms` between key events (xcua types any Unicode
+    /// itself, so this is one request).
+    pub fn type_slowly(&self, text: &str, delay_ms: u32) -> Result<Out> {
+        self.call(&Request::Type { text: text.to_string(), delay_ms: Some(delay_ms) })?;
         let shown: String = text.chars().take(40).collect();
         self.stamp(&format!("type {shown:?}"));
         Ok(Out::ok("OK", json!({ "ok": true, "chars": text.chars().count() })))
@@ -302,6 +308,84 @@ impl Ctx {
             format!("timed out after {secs:.1}s, no change (change ratio {ratio:.4})")
         };
         Ok(Out { text, json: json!({ "changed": changed, "seconds": secs, "ratio": ratio }), code: if changed { 0 } else { TIMED_OUT } })
+    }
+
+    /// Wait until an application window matching `name`/`class` is mapped
+    /// and, with `painted`, until its area of the screen is not one colour.
+    pub fn wait_window(&self, name: Option<&str>, class: Option<&str>, painted: bool, timeout_ms: u32) -> Result<Out> {
+        let t0 = Instant::now();
+        let limit = Duration::from_millis(timeout_ms as u64);
+        let mut seen: Option<crate::x11::AppWindow> = None;
+        loop {
+            let found = self.backend.with_x(|c, root| {
+                crate::x11::app_windows(c, root).into_iter().rev().find(|w| w.matches(name, class))
+            });
+            if let Some(w) = found {
+                let ready = !painted || {
+                    let r = self.call(&Request::Screenshot {
+                        max_side: Some(320),
+                        format: ImageFormat::Png,
+                        quality: None,
+                        cursor: Some(false),
+                        region: Some(w.rect()),
+                    });
+                    match r {
+                        Ok(reply) => image::load_from_memory(&reply.payload)
+                            .map(|i| !crate::x11::uniform(i.into_rgba8().as_raw()))
+                            .unwrap_or(false),
+                        // Off-screen or zero-sized for now: not painted.
+                        Err(_) => false,
+                    }
+                };
+                if ready {
+                    let secs = t0.elapsed().as_secs_f32();
+                    self.stamp(&format!("wait_window -> {}", w.summary()));
+                    return Ok(Out::ok(
+                        format!("{} after {secs:.1}s: {}", if painted { "painted" } else { "mapped" }, w.summary()),
+                        json!({ "found": true, "seconds": secs, "window": w }),
+                    ));
+                }
+                seen = Some(w);
+            }
+            if t0.elapsed() >= limit {
+                let secs = t0.elapsed().as_secs_f32();
+                let text = match &seen {
+                    Some(w) => format!("timed out after {secs:.1}s: {} is mapped but still one colour", w.summary()),
+                    None => {
+                        let all: Vec<String> = self.backend.with_x(crate::x11::app_windows).iter().map(|w| w.summary()).collect();
+                        format!(
+                            "timed out after {secs:.1}s: no matching window; windows now: {}",
+                            if all.is_empty() { "none".to_string() } else { all.join("; ") }
+                        )
+                    }
+                };
+                return Ok(Out { text, json: json!({ "found": false, "seconds": secs, "window": seen }), code: TIMED_OUT });
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Make the window matching `class` (default: the focused one) fill
+    /// the screen.
+    pub fn maximize(&self, class: Option<&str>) -> Result<Out> {
+        let r = self.backend.with_x(|c, root| -> Result<(crate::x11::AppWindow, &'static str, Option<crate::x11::AppWindow>)> {
+            let w = match class {
+                Some(k) => crate::x11::app_windows(c, root)
+                    .into_iter()
+                    .rev()
+                    .find(|w| w.matches(None, Some(k)))
+                    .ok_or_else(|| anyhow!("no window with class matching {k:?}"))?,
+                None => crate::x11::focused_app(c, root)
+                    .ok_or_else(|| anyhow!("no window has the keyboard; click one or pass --class"))?,
+            };
+            let how = crate::x11::maximize(c, root, &w)?;
+            let after = crate::x11::app_window(c, root, w.top, w.client);
+            Ok((w, how, after))
+        })?;
+        let (before, how, after) = r;
+        self.stamp(&format!("maximize {}", before.summary()));
+        let now = after.as_ref().map(|a| a.summary()).unwrap_or_default();
+        Ok(Out::ok(format!("{how}: {now}"), json!({ "ok": true, "how": how, "window": after })))
     }
 
     pub fn focused(&self) -> Result<Out> {

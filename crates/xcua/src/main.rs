@@ -160,6 +160,10 @@ enum Cmd {
     Type {
         #[arg(allow_hyphen_values = true)]
         text: String,
+        /// Milliseconds between key events; raise it for apps that drop
+        /// fast input.
+        #[arg(long, default_value_t = 12)]
+        delay_ms: u32,
     },
     /// Press key chords in order, xdotool names: `key ctrl+l`, `key Return`,
     /// `key ctrl+a BackSpace`.
@@ -217,6 +221,26 @@ enum Cmd {
     },
     /// Which window has the keyboard: id, title, class, pid, geometry.
     Focused,
+    /// Wait until an app window (title/class substring) is mapped and, with
+    /// --painted, drawn into (its screen area not one colour). Exit 3 on
+    /// timeout. A browser's first window can take 30 s or more.
+    WaitWindow {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        class: Option<String>,
+        #[arg(long)]
+        painted: bool,
+        /// Milliseconds.
+        #[arg(long, default_value_t = 30000)]
+        timeout: u32,
+    },
+    /// Make a window fill the screen: the one matching --class, else the
+    /// focused one. Uses the window manager when there is one.
+    Maximize {
+        #[arg(long)]
+        class: Option<String>,
+    },
     /// Run several actions (the MCP computer_batch shape, JSON or `-` for
     /// stdin); stops at the first failure. Screenshots go to --out-dir.
     Batch {
@@ -407,7 +431,9 @@ fn run(cli: Cli) -> Result<Out> {
             }
             open(false)?.scroll(Some((*x, *y)), *dx, *dy, &mods(m))
         }
-        Cmd::Type { text } => open(false)?.type_text(&cli::text_arg(text)?),
+        Cmd::Type { text, delay_ms } => open(false)?.type_slowly(&cli::text_arg(text)?, *delay_ms),
+        Cmd::WaitWindow { name, class, painted, timeout } => open(false)?.wait_window(name.as_deref(), class.as_deref(), *painted, *timeout),
+        Cmd::Maximize { class } => open(false)?.maximize(class.as_deref()),
         Cmd::Key { combos, repeat } => open(false)?.key(combos, *repeat),
         Cmd::Hold { keys, seconds } => open(false)?.hold(keys, *seconds),
         Cmd::Cursor => open(false)?.cursor(),
@@ -600,6 +626,7 @@ fn mcp(state: &State, display: Option<&str>, size: (u32, u32), shm: bool, max_si
             name: Some("xcua".into()),
             instructions: Some(instructions(&d, state)),
             descriptions: DESCRIPTIONS.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect(),
+            version: Some(env!("KMSCUA_BUILD").to_string()),
         };
         let rt = tokio::runtime::Runtime::new()?;
         let served = rt.block_on(async {
@@ -761,7 +788,7 @@ mod tests {
     #[test]
     fn text_may_start_with_a_hyphen() {
         let c = Cli::try_parse_from(["xcua", "type", "-5 degrees"]).unwrap();
-        assert!(matches!(&c.cmd, Cmd::Type { text } if text == "-5 degrees"));
+        assert!(matches!(&c.cmd, Cmd::Type { text, delay_ms: 12 } if text == "-5 degrees"));
         let c = Cli::try_parse_from(["xcua", "record", "mark", "-x"]).unwrap();
         assert!(matches!(&c.cmd, Cmd::Record(RecordCmd::Mark { note }) if note == "-x"));
     }

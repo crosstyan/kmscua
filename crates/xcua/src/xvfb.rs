@@ -771,7 +771,7 @@ pub fn up_with(state: &State, display: Option<&str>, owner: Owner, start_size: (
             }
             if !opts.restart {
                 let up = reuse(state, owner, d.clone(), p)?;
-                let notes = apply_wm(state, &d, opts.wm.as_deref())?;
+                let notes = apply_wm(state, &d, opts.wm.as_deref()).map_err(|e| display_is_up(e, &d))?;
                 return Ok((up, notes));
             }
             let nonce = state.nonce();
@@ -826,8 +826,15 @@ pub fn up_with(state: &State, display: Option<&str>, owner: Owner, start_size: (
     if let Owner::Mcp(me) = owner {
         state.add_user(me)?;
     }
-    let notes = apply_wm(state, &display, wm_want.as_deref())?;
+    let notes = apply_wm(state, &display, wm_want.as_deref()).map_err(|e| display_is_up(e, &display))?;
     Ok((Up::Started { display, pid: proc.pid }, notes))
+}
+
+/// A WM error after the display came up: say that the display is fine.
+fn display_is_up(e: anyhow::Error, display: &str) -> anyhow::Error {
+    e.context(format!(
+        "the display {display} itself is up and usable (export DISPLAY={display}); only the window manager failed"
+    ))
 }
 
 /// The size of `display`'s root window, within 2 s.
@@ -865,9 +872,16 @@ fn apply_wm(state: &State, display: &str, want: Option<&str>) -> Result<Vec<Stri
         return Ok(stop_wm(state).into_iter().collect());
     }
     let cmd = if want == "auto" {
-        find_wm()
-            .ok_or_else(|| anyhow!("--wm auto: no window manager installed (looked for {})", WM_CANDIDATES.join(", ")))?
-            .to_string()
+        match find_wm() {
+            Some(w) => w.to_string(),
+            // Not fatal: the display is up and works without one.
+            None => {
+                return Ok(vec![format!(
+                    "warning: no window manager installed (looked for {}); continuing without one (keys go to the window under the pointer)",
+                    WM_CANDIDATES.join(", ")
+                )])
+            }
+        }
     } else {
         want.to_string()
     };

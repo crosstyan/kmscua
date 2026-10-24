@@ -56,6 +56,13 @@ fn shot(b: &XBackend, max_side: Option<u32>, region: Option<Rect>) -> (Screensho
 /// A mapped 200x150 red window at (100, 100) that reports keys, buttons
 /// and focus, on its own client connection.
 fn red_window(display: &str) -> (RustConnection, u32) {
+    app_window(display, (100, 100, 200, 150), 0xff0000, None)
+}
+
+/// A mapped window at `(x, y, w, h)` filled with `color`, with
+/// `WM_CLASS`/title `class` when given, reporting keys, buttons and focus.
+fn app_window(display: &str, (x, y, w, h): (i16, i16, u16, u16), color: u32, class: Option<&str>) -> (RustConnection, u32) {
+    use x11rb::wrapper::ConnectionExt as _;
     let (conn, screen) = RustConnection::connect(Some(display)).unwrap();
     let root = conn.setup().roots[screen].root;
     let win = conn.generate_id().unwrap();
@@ -64,16 +71,23 @@ fn red_window(display: &str) -> (RustConnection, u32) {
         0,
         win,
         root,
-        100,
-        100,
-        200,
-        150,
+        x,
+        y,
+        w,
+        h,
         0,
         WindowClass::INPUT_OUTPUT,
         0,
-        &CreateWindowAux::new().background_pixel(0xff0000).event_mask(mask),
+        &CreateWindowAux::new().background_pixel(color).event_mask(mask),
     )
     .unwrap();
+    if let Some(c) = class {
+        let wm_class = format!("{c}\0{}\0", c.to_uppercase());
+        conn.change_property8(x11rb::protocol::xproto::PropMode::REPLACE, win, x11rb::protocol::xproto::AtomEnum::WM_CLASS, x11rb::protocol::xproto::AtomEnum::STRING, wm_class.as_bytes())
+            .unwrap();
+        conn.change_property8(x11rb::protocol::xproto::PropMode::REPLACE, win, x11rb::protocol::xproto::AtomEnum::WM_NAME, x11rb::protocol::xproto::AtomEnum::STRING, format!("{c} window").as_bytes())
+            .unwrap();
+    }
     conn.map_window(win).unwrap();
     conn.flush().unwrap();
     let ok = wait_events(&conn, 1, Duration::from_secs(10), |e| matches!(e, Event::MapNotify(_)));
@@ -254,11 +268,13 @@ struct Cli {
     display_env: Option<String>,
     /// Run every command under this (bwrap …), except the cleanup `down`.
     wrap: Vec<String>,
+    /// Extra environment for every command except the cleanup `down`.
+    env: Vec<(String, String)>,
 }
 
 impl Cli {
     fn new(state: std::path::PathBuf, display_env: Option<&str>) -> Self {
-        Self { state, display_env: display_env.map(str::to_string), wrap: Vec::new() }
+        Self { state, display_env: display_env.map(str::to_string), wrap: Vec::new(), env: Vec::new() }
     }
 
     fn cmd(&self) -> std::process::Command {
@@ -275,6 +291,7 @@ impl Cli {
             Some(d) => c.env("DISPLAY", d),
             None => c.env_remove("DISPLAY"),
         };
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
         c
     }
 
@@ -321,8 +338,10 @@ impl Cli {
 
 impl Drop for Cli {
     fn drop(&mut self) {
-        // With /proc, so a test that failed under bwrap still cleans up.
+        // With /proc and the usual PATH, so a test that failed under bwrap
+        // or with a narrowed PATH still cleans up.
         self.wrap.clear();
+        self.env.clear();
         if let Some(pid) = self.pid() {
             // A test may have left it stopped.
             unsafe { libc::kill(pid, libc::SIGCONT) };
@@ -1082,4 +1101,107 @@ fn no_proc_never_signals_a_wm_pid() {
     let _ = bystander.wait();
     drop(cli);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--wm auto` with no WM installed is a warning, not a failure; an
+/// explicit WM that cannot start fails, saying the display is up.
+#[test]
+fn wm_failures_say_the_display_is_up() {
+    let (Some(xvfb_bin), Some(xkbcomp)) = (xcua::xvfb::on_path("Xvfb"), xcua::xvfb::on_path("xkbcomp")) else { return };
+    let dir = std::env::temp_dir().join(format!("xcua-test-nowm-{}", std::process::id()));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (src, name) in [(&xvfb_bin, "Xvfb"), (&xkbcomp, "xkbcomp")] {
+        let _ = std::os::unix::fs::symlink(src, bin.join(name));
+    }
+    let mut cli = Cli::new(dir.join("state"), None);
+    // A PATH with Xvfb and nothing else: no window manager to find.
+    cli.env.push(("PATH".into(), bin.display().to_string()));
+    let out = cli.ok(&["up", "--size", "320x240", "--wm", "auto"]);
+    assert!(out.contains("no window manager installed") && out.contains("continuing without one"), "{out}");
+    let display = cli.env_display().unwrap();
+    assert!(xcua::xvfb::answers(&display));
+    let (ok, text) = cli.run(&["up", "--wm", "/nonexistent/wm"]);
+    assert!(!ok && text.contains("itself is up and usable"), "{text}");
+    assert!(xcua::xvfb::answers(&display), "a failed WM took the display down");
+    drop(cli);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `wait-window` finds a window that maps late, by class, and with
+/// --painted waits until it is drawn into.
+#[test]
+fn wait_window_mapped_then_painted() {
+    let Some(x) = xvfb("waitwin") else { return };
+    let cli = Cli::new(x.dir.join("state"), None);
+    let d = x.display.clone();
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(800));
+        app_window(&d, (50, 60, 300, 200), 0x336699, Some("xcuatest"))
+    });
+    let out = cli.ok(&["--display", &x.display, "wait-window", "--class", "XCUATEST", "--timeout", "10000"]);
+    assert!(out.starts_with("mapped after") && out.contains("xcuatest window") && out.contains("300x200+50+60"), "{out}");
+    let (conn, win) = late.join().unwrap();
+    // One colour: not painted.
+    let (ok, text) = cli.run(&["--display", &x.display, "wait-window", "--class", "xcuatest", "--painted", "--timeout", "1200"]);
+    assert!(!ok && text.contains("still one colour"), "{text}");
+    // Draw something: painted.
+    let gc = conn.generate_id().unwrap();
+    conn.create_gc(gc, win, &x11rb::protocol::xproto::CreateGCAux::new().foreground(0xffffff)).unwrap();
+    conn.poly_fill_rectangle(win, gc, &[x11rb::protocol::xproto::Rectangle { x: 20, y: 20, width: 120, height: 40 }]).unwrap();
+    conn.flush().unwrap();
+    let out = cli.ok(&["--display", &x.display, "wait-window", "--class", "xcuatest", "--painted", "--timeout", "5000"]);
+    assert!(out.starts_with("painted after"), "{out}");
+    let (ok, text) = cli.run(&["--display", &x.display, "wait-window", "--name", "nosuch", "--timeout", "500"]);
+    assert!(!ok && text.contains("no matching window") && text.contains("xcuatest"), "{text}");
+}
+
+/// `type` waits for the focus to settle: a focus change that lands just
+/// after it starts (a WM's click-to-focus, an app moving focus into a
+/// field) does not split the text between two windows.
+#[test]
+fn type_waits_for_focus_to_settle() {
+    let Some(x) = xvfb("settle") else { return };
+    let b = backend(&x, false);
+    let (ca, wa) = app_window(&x.display, (10, 10, 100, 100), 0xff0000, None);
+    let (cb, wb) = app_window(&x.display, (200, 10, 100, 100), 0x00ff00, None);
+    ca.set_input_focus(x11rb::protocol::xproto::InputFocus::POINTER_ROOT, wa, x11rb::CURRENT_TIME).unwrap();
+    ca.flush().unwrap();
+    ca.get_input_focus().unwrap().reply().unwrap();
+    let mover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        cb.set_input_focus(x11rb::protocol::xproto::InputFocus::POINTER_ROOT, wb, x11rb::CURRENT_TIME).unwrap();
+        cb.flush().unwrap();
+        cb
+    });
+    b.call(&Request::Type { text: "hello".into(), delay_ms: None }).unwrap();
+    let cb = mover.join().unwrap();
+    let on_a = wait_events(&ca, 5, Duration::from_millis(300), |e| matches!(e, Event::KeyPress(_)));
+    let on_b = wait_events(&cb, 5, Duration::from_secs(5), |e| matches!(e, Event::KeyPress(_)));
+    assert_eq!((on_a.len(), on_b.len()), (0, 5), "text split between the old and the new focus");
+}
+
+/// `maximize` fills the screen: by ConfigureWindow without a WM, and
+/// under twm (no EWMH) by the same fallback.
+#[test]
+fn maximize_fills_the_screen() {
+    let Some(x) = xvfb("max") else { return };
+    let cli = Cli::new(x.dir.join("state"), None);
+    let (_conn, _win) = app_window(&x.display, (100, 100, 200, 150), 0x336699, Some("xcuatest"));
+    let out = cli.ok(&["--display", &x.display, "maximize", "--class", "xcuatest"]);
+    assert!(out.contains("640x480+0+0"), "{out}");
+    let (ok, text) = cli.run(&["--display", &x.display, "maximize"]);
+    assert!(!ok && text.contains("no window has the keyboard"), "{text}");
+
+    if xcua::xvfb::on_path("twm").is_some() {
+        let dir = std::env::temp_dir().join(format!("xcua-test-maxtwm-{}", std::process::id()));
+        let cli = Cli::new(dir.join("state"), None);
+        cli.ok(&["up", "--size", "640x480", "--wm", "twm"]);
+        let display = cli.env_display().unwrap();
+        let (_conn, _win) = app_window(&display, (100, 100, 200, 150), 0x336699, Some("xcuatest"));
+        let out = cli.ok(&["maximize", "--class", "xcuatest"]);
+        assert!(out.contains("resized to the screen") || out.contains("maximized"), "{out}");
+        drop(cli);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
