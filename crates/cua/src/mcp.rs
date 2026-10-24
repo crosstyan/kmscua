@@ -704,6 +704,18 @@ impl CuaServer {
         }
     }
 
+    /// Replace the descriptions of the named tools (unknown names are
+    /// ignored), for a backend whose tools behave differently from cuad's:
+    /// stills instead of an MP4, say. The parameters stay as they are.
+    pub fn with_descriptions<'a>(mut self, descriptions: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        for (name, text) in descriptions {
+            if let Some(route) = self.tool_router.map.get_mut(name) {
+                route.attr.description = Some(text.to_string().into());
+            }
+        }
+        self
+    }
+
     /// Present the server under another name and instructions than cua's.
     pub fn with_identity(mut self, name: impl Into<String>, instructions: impl Into<String>) -> Self {
         self.identity = Arc::new((name.into(), instructions.into()));
@@ -1185,6 +1197,9 @@ pub struct ServeOptions {
     pub name: Option<String>,
     /// Instructions at `initialize`; None = cua's (GPU scanout wording).
     pub instructions: Option<String>,
+    /// `(tool, description)` pairs replacing cua's tool descriptions; empty
+    /// keeps them all.
+    pub descriptions: Vec<(String, String)>,
 }
 
 /// Serve the tools on stdio with `backend` answering the requests, until
@@ -1196,6 +1211,7 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>, opts: ServeOptions) -> anyho
         let instructions = opts.instructions.unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
         server = server.with_identity(name, instructions);
     }
+    server = server.with_descriptions(opts.descriptions.iter().map(|(n, d)| (n.as_str(), d.as_str())));
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
