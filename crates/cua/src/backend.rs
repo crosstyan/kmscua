@@ -1,0 +1,62 @@
+//! The seam between the MCP layer and whatever does the work.
+//!
+//! `cua` talks to cuad over its socket; another backend (an in-process X11
+//! server, a test double) answers the same `kmscua_proto::Request`s itself.
+//! Everything above this trait, the tool vocabulary, the coordinate view,
+//! the waits and the recording timeline, is shared.
+
+use std::time::Duration;
+
+use anyhow::Result;
+use kmscua_proto::{Client, Reply, Request, Status};
+
+/// Answers `kmscua_proto` requests. Called from blocking threads, never from
+/// the async runtime, so an implementation may block.
+///
+/// The contract is cuad's: every coordinate is a source pixel (the space of
+/// a native screenshot), a request that presses something releases it before
+/// it answers, and a failed request is `Err`, never an `Ok` reply with
+/// `header.ok == false`. A `Screenshot` reply carries a `ScreenshotInfo` in
+/// `header.data` and the encoded image as `payload`; `Record*` replies carry
+/// a `RecordInfo` whose `path` is an MP4 or a stills directory (see
+/// [`crate::stills`]).
+pub trait Backend: Send + Sync {
+    fn call(&self, req: &Request) -> Result<Reply>;
+
+    /// `call` for a request that may run longer than the usual timeout
+    /// (`KeyHold`). Backends without a timeout keep the default.
+    fn call_timeout(&self, req: &Request, timeout: Duration) -> Result<Reply> {
+        let _ = timeout;
+        self.call(req)
+    }
+
+    /// Text for `get_focused`. `None` (the default) falls back to AT-SPI
+    /// when the `atspi` feature is on, and to an "unavailable" error when it
+    /// is off.
+    fn focused(&self) -> Option<Result<String>> {
+        None
+    }
+
+    /// Report for the `doctor` tool. The default renders `Status`.
+    fn doctor(&self) -> String {
+        let v = match self.call(&Request::Status).and_then(|r| r.data::<Status>()) {
+            Ok(s) => serde_json::json!({ "daemon": s }),
+            Err(e) => serde_json::json!({ "daemon": null, "daemon_error": format!("{e:#}") }),
+        };
+        serde_json::to_string_pretty(&v).unwrap_or_default()
+    }
+}
+
+impl Backend for Client {
+    fn call(&self, req: &Request) -> Result<Reply> {
+        Client::call(self, req)
+    }
+
+    fn call_timeout(&self, req: &Request, timeout: Duration) -> Result<Reply> {
+        self.with_timeout(timeout).call(req)
+    }
+
+    fn doctor(&self) -> String {
+        serde_json::to_string_pretty(&crate::doctor(self)).unwrap_or_default()
+    }
+}

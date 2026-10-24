@@ -57,10 +57,13 @@ crates/cuad    root daemon
                keymap.rs    US layout and xdotool key names
                recorder.rs  fixed-rate frame loop into a gst-launch child, MP4 out
                server.rs    unix socket loop + capture worker thread
-crates/cua     client
+crates/cua     client; also the library kmscua_mcp (feature `atspi`, default on)
                main.rs      CLI
+               lib.rs       serve_stdio, typing with clipboard fallback, doctor
+               backend.rs   Backend trait: who answers the requests (cuad's Client, or in-process)
                mcp.rs       MCP server (rmcp), coordinate mapping, wait/record extras
                video.rs     ffmpeg contact sheets, frames, scene changes, timeline sidecar
+               stills.rs    recordings as a directory of JPEG stills (layout contract)
                session.rs   finds the user's Wayland/X/D-Bus env from /proc
 third_party/libdrmtap   vendored MIT library with the Tegra cursor EGL fallback patch
 packaging/     systemd unit + install script

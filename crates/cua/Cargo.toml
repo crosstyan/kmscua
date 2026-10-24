@@ -5,9 +5,22 @@ edition.workspace = true
 license.workspace = true
 description = "kmscua client: CLI and MCP server for agents; talks to cuad and to AT-SPI"
 
+# The MCP vocabulary, the recording readers and the cuad client seam, as a
+# library so another backend (an in-process X11 server, say) can serve the
+# same tools without cuad.
+[lib]
+name = "kmscua_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cua"
 path = "src/main.rs"
+
+[features]
+default = ["atspi"]
+# get_focused through AT-SPI over D-Bus. Without it the lib links no D-Bus
+# code and get_focused answers only through `Backend::focused`.
+atspi = ["dep:atspi", "dep:zbus", "dep:futures-util"]
 
 [dependencies]
 kmscua-proto = { path = "../proto" }
@@ -22,7 +35,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 schemars = "1.0"
 rmcp = { version = "1.5.0", features = ["transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync"] }
-atspi = { version = "0.29", default-features = false, features = ["proxies", "connection", "tokio"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-futures-util = { version = "0.3", default-features = false }
+atspi = { version = "0.29", default-features = false, features = ["proxies", "connection", "tokio"], optional = true }
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

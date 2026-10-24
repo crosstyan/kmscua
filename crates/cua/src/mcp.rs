@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
-use kmscua_proto::{
-    Button, Client, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo,
-};
+use kmscua_proto::{Button, CursorInfo, ImageFormat, RecordInfo, Rect, Request, ScreenshotInfo};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
@@ -33,7 +31,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::{atspi, video};
+#[cfg(feature = "atspi")]
+use crate::atspi;
+use crate::{video, Backend};
 
 /// Default longest side of a screenshot. 1080p is Anthropic's documented
 /// balance of accuracy and cost; the models accept up to 2576 px.
@@ -71,10 +71,11 @@ const EXTRA_TOOLS: &[&str] = &[
 
 #[derive(Clone)]
 pub struct CuaServer {
-    client: Arc<Client>,
+    backend: Arc<dyn Backend>,
     view: Arc<Mutex<View>>,
     rec: Arc<Mutex<Option<RecState>>>,
     last_rec: Arc<Mutex<Option<PathBuf>>>,
+    #[cfg(feature = "atspi")]
     ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
     max_side: u32,
     tool_router: ToolRouter<Self>,
@@ -316,10 +317,10 @@ impl CuaServer {
 
     async fn blocking<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&Client) -> anyhow::Result<T> + Send + 'static,
+        f: impl FnOnce(&dyn Backend) -> anyhow::Result<T> + Send + 'static,
     ) -> Result<T, ErrorData> {
-        let client = self.client.clone();
-        tokio::task::spawn_blocking(move || f(&client))
+        let backend = self.backend.clone();
+        tokio::task::spawn_blocking(move || f(&*backend))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             .map_err(err)
@@ -381,8 +382,8 @@ impl CuaServer {
         Ok(Content::image(b64, info.mime))
     }
 
-    fn sample(client: &Client, region: Option<Rect>) -> anyhow::Result<Vec<u8>> {
-        let reply = client.call(&Request::Screenshot {
+    fn sample(backend: &dyn Backend, region: Option<Rect>) -> anyhow::Result<Vec<u8>> {
+        let reply = backend.call(&Request::Screenshot {
             max_side: Some(320),
             format: ImageFormat::Png,
             quality: None,
@@ -530,8 +531,7 @@ impl CuaServer {
         let combo = text.to_string();
         let secs = duration.clamp(0.0, 100.0);
         self.blocking(move |c| {
-            c.with_timeout(Duration::from_secs_f32(secs + 20.0))
-                .call(&Request::KeyHold { keys: vec![combo], seconds: secs })
+            c.call_timeout(&Request::KeyHold { keys: vec![combo], seconds: secs }, Duration::from_secs_f32(secs + 20.0))
         })
         .await
         .map(|_| ())
@@ -580,6 +580,30 @@ impl CuaServer {
             .unwrap()
             .clone()
             .ok_or_else(|| bad("no recording in this session; pass `path` or call record_stop first"))
+    }
+
+    /// `get_focused` when the backend has no answer of its own.
+    #[cfg(feature = "atspi")]
+    async fn atspi_focused(&self) -> Result<String, ErrorData> {
+        let mut ui = self.ui.lock().await;
+        if ui.is_none() {
+            *ui = Some(atspi::Ui::connect().await.map_err(err)?);
+        }
+        match ui.as_ref().unwrap().get_focused().await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                *ui = None;
+                Err(err(e))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "atspi"))]
+    async fn atspi_focused(&self) -> Result<String, ErrorData> {
+        Err(ErrorData::internal_error(
+            "get_focused is unavailable: this backend does not answer it and the server was built without the atspi feature",
+            None,
+        ))
     }
 
     /// Run one batch action. Returns the content to append.
@@ -655,7 +679,7 @@ impl CuaServer {
 
 #[tool_router]
 impl CuaServer {
-    pub fn new(client: Client, max_side: u32, core_only: bool) -> Self {
+    pub fn new(backend: Arc<dyn Backend>, max_side: u32, core_only: bool) -> Self {
         let mut tool_router = Self::tool_router();
         if core_only {
             for t in EXTRA_TOOLS {
@@ -663,10 +687,11 @@ impl CuaServer {
             }
         }
         Self {
-            client: Arc::new(client),
+            backend,
             view: Arc::new(Mutex::new(View { scale: 1.0, ox: 0, oy: 0, src_w: 0, src_h: 0 })),
             rec: Arc::new(Mutex::new(None)),
             last_rec: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "atspi")]
             ui: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
             tool_router,
@@ -1114,24 +1139,17 @@ impl CuaServer {
         description = "Read, through the accessibility bus, which application and window are active and what element has keyboard focus: its role, name, states, the exact text it holds and the caret position. Use it instead of zoom when you need text verbatim (a path, a number, what you just typed). Coverage depends on the app: GTK, Qt, terminals and Electron with accessibility on answer well; Flutter, GL canvases, video and games expose little or nothing, so a thin answer means the app is silent, not that the field is empty. Trust the screenshot when they disagree. Nothing here changes the screen."
     )]
     async fn get_focused(&self) -> Result<CallToolResult, ErrorData> {
-        let mut ui = self.ui.lock().await;
-        if ui.is_none() {
-            *ui = Some(atspi::Ui::connect().await.map_err(err)?);
-        }
-        let text = match ui.as_ref().unwrap().get_focused().await {
-            Ok(t) => t,
-            Err(e) => {
-                *ui = None;
-                return Err(err(e));
-            }
+        let text = match self.blocking(|b| b.focused().transpose()).await? {
+            Some(t) => t,
+            None => self.atspi_focused().await?,
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(name = "doctor", description = "Report whether capture, input, clipboard paste and recording are available and why not.")]
     async fn doctor(&self) -> Result<CallToolResult, ErrorData> {
-        let d = self.blocking(|c| Ok(crate::doctor(c))).await?;
-        Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&d).unwrap_or_default())]))
+        let d = self.blocking(|c| Ok(c.doctor())).await?;
+        Ok(CallToolResult::success(vec![Content::text(d)]))
     }
 }
 
@@ -1146,8 +1164,19 @@ impl ServerHandler for CuaServer {
     }
 }
 
-pub async fn serve(client: Client, max_side: Option<u32>, core_only: bool) -> anyhow::Result<()> {
-    let server = CuaServer::new(client, max_side.unwrap_or(DEFAULT_MAX_SIDE), core_only);
+/// What `cua mcp` takes on its command line.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServeOptions {
+    /// Longest side of screenshots sent to the model; None = 1920.
+    pub max_side: Option<u32>,
+    /// Only the vendor-shaped tools (`--tools core`).
+    pub core_only: bool,
+}
+
+/// Serve the tools on stdio with `backend` answering the requests, until
+/// the client hangs up. This is all `cua mcp` does.
+pub async fn serve_stdio(backend: Arc<dyn Backend>, opts: ServeOptions) -> anyhow::Result<()> {
+    let server = CuaServer::new(backend, opts.max_side.unwrap_or(DEFAULT_MAX_SIDE), opts.core_only);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

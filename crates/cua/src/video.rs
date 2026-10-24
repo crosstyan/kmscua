@@ -1,6 +1,10 @@
 //! Turning a recording into things a model can look at: contact sheets,
 //! frames at times, scene-change times. All through `ffmpeg`/`ffprobe`,
 //! which decode H.264 fine on the CPU for this purpose.
+//!
+//! A recording path that is a directory holds JPEG stills instead of an
+//! MP4; `probe`, `duration`, `frames_at`, `changes` and `contact_sheet`
+//! hand it to [`crate::stills`], which documents that layout.
 
 use std::io::Write;
 use std::path::Path;
@@ -8,6 +12,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::stills;
 
 fn run(cmd: &mut Command) -> Result<Vec<u8>> {
     let out = cmd.stdin(Stdio::null()).output().with_context(|| format!("run {:?}", cmd.get_program()))?;
@@ -52,6 +58,9 @@ impl Crop {
 
 /// Width, height and frames per second of the video stream.
 pub fn probe(path: &Path) -> Result<(u32, u32, f32)> {
+    if path.is_dir() {
+        return stills::probe(path);
+    }
     let out = run(Command::new("ffprobe").args([
         "-v",
         "error",
@@ -78,6 +87,9 @@ pub fn probe(path: &Path) -> Result<(u32, u32, f32)> {
 }
 
 pub fn duration(path: &Path) -> Result<f32> {
+    if path.is_dir() {
+        return stills::duration(path);
+    }
     let out = run(Command::new("ffprobe").args([
         "-v",
         "error",
@@ -104,6 +116,11 @@ pub fn contact_sheet(path: &Path, dur: f32, tiles: u32, tile_w: u32) -> Result<(
     let times: Vec<f32> = (0..tiles)
         .map(|i| if tiles == 1 { 0.0 } else { (dur - 0.05).max(0.0) * i as f32 / (tiles - 1) as f32 })
         .collect();
+    if path.is_dir() {
+        let frames = frames_at(path, &times, tile_w, None)?;
+        let pngs: Vec<Vec<u8>> = frames.iter().map(|(_, p)| p.clone()).collect();
+        return Ok((tile(&pngs, cols)?, frames.iter().map(|(t, _)| *t).collect()));
+    }
     // select by nearest frame to each time: build a select expression.
     let select = times
         .iter()
@@ -126,6 +143,9 @@ pub fn contact_sheet(path: &Path, dur: f32, tiles: u32, tile_w: u32) -> Result<(
 /// One PNG per requested time, cropped to `crop` if given, scaled so the
 /// longest side is `max_side`.
 pub fn frames_at(path: &Path, times: &[f32], max_side: u32, crop: Option<Crop>) -> Result<Vec<(f32, Vec<u8>)>> {
+    if path.is_dir() {
+        return stills::frames_at(path, times, max_side, crop);
+    }
     // A seek at or past the last frame's PTS yields nothing; pull the end in.
     let last = (duration(path)? - 0.1).max(0.0);
     let crop_vf = crop.map(|c| c.vf()).unwrap_or_default();
@@ -169,6 +189,9 @@ pub struct Run {
 /// the frame before. Returns the runs of changed frames and the total frame
 /// count examined. Exact for UI where ffmpeg's scene score is not.
 pub fn changes(path: &Path, from: f32, to: f32, crop: Option<Crop>, threshold: f32) -> Result<(Vec<Run>, u32)> {
+    if path.is_dir() {
+        return stills::changes(path, from, to, crop, threshold);
+    }
     let (vw, vh, fps) = probe(path)?;
     let (cw, ch) = crop.map(|c| (c.w, c.h)).unwrap_or((vw, vh));
     let w = 320u32.min(cw);
