@@ -78,8 +78,13 @@ pub struct CuaServer {
     #[cfg(feature = "atspi")]
     ui: Arc<tokio::sync::Mutex<Option<atspi::Ui>>>,
     max_side: u32,
+    /// Server name and instructions sent at `initialize`.
+    identity: Arc<(String, String)>,
     tool_router: ToolRouter<Self>,
 }
+
+const DEFAULT_NAME: &str = "kmscua";
+const DEFAULT_INSTRUCTIONS: &str = "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.";
 
 fn err(e: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(format!("{e:#}"), None)
@@ -694,8 +699,15 @@ impl CuaServer {
             #[cfg(feature = "atspi")]
             ui: Arc::new(tokio::sync::Mutex::new(None)),
             max_side,
+            identity: Arc::new((DEFAULT_NAME.to_string(), DEFAULT_INSTRUCTIONS.to_string())),
             tool_router,
         }
+    }
+
+    /// Present the server under another name and instructions than cua's.
+    pub fn with_identity(mut self, name: impl Into<String>, instructions: impl Into<String>) -> Self {
+        self.identity = Arc::new((name.into(), instructions.into()));
+        self
     }
 
     // ----- Claude family -----
@@ -1157,26 +1169,33 @@ impl CuaServer {
 impl ServerHandler for CuaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("kmscua", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Computer use for Linux, below the compositor. Take a screenshot first; every coordinate you pass is in that image's pixels, and zoom never changes that. Actions answer OK and never leave a key or button held (except left_mouse_down). Use wait_for_stable after actions that trigger loading, or pass settle=true on the action. Use record_start/record_stop around a multi-step task when you need to see what happened between actions; ask for stills with record_frames.",
-            )
+            .with_server_info(Implementation::new(self.identity.0.clone(), env!("CARGO_PKG_VERSION")))
+            .with_instructions(self.identity.1.clone())
     }
 }
 
 /// What `cua mcp` takes on its command line.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ServeOptions {
     /// Longest side of screenshots sent to the model; None = 1920.
     pub max_side: Option<u32>,
     /// Only the vendor-shaped tools (`--tools core`).
     pub core_only: bool,
+    /// Server name at `initialize`; None = "kmscua".
+    pub name: Option<String>,
+    /// Instructions at `initialize`; None = cua's (GPU scanout wording).
+    pub instructions: Option<String>,
 }
 
 /// Serve the tools on stdio with `backend` answering the requests, until
 /// the client hangs up. This is all `cua mcp` does.
 pub async fn serve_stdio(backend: Arc<dyn Backend>, opts: ServeOptions) -> anyhow::Result<()> {
-    let server = CuaServer::new(backend, opts.max_side.unwrap_or(DEFAULT_MAX_SIDE), opts.core_only);
+    let mut server = CuaServer::new(backend, opts.max_side.unwrap_or(DEFAULT_MAX_SIDE), opts.core_only);
+    if opts.name.is_some() || opts.instructions.is_some() {
+        let name = opts.name.unwrap_or_else(|| DEFAULT_NAME.to_string());
+        let instructions = opts.instructions.unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
+        server = server.with_identity(name, instructions);
+    }
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

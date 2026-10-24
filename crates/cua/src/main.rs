@@ -331,7 +331,7 @@ fn main() -> Result<()> {
                 other => bail!("--tools must be all or core, not {other}"),
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(kmscua_mcp::serve_stdio(Arc::new(c), ServeOptions { max_side: *max_side, core_only: core }))
+            rt.block_on(kmscua_mcp::serve_stdio(Arc::new(c), ServeOptions { max_side: *max_side, core_only: core, ..Default::default() }))
         }
     }
 }
