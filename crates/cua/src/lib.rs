@@ -25,8 +25,10 @@ pub use mcp::{serve_stdio, CuaServer, ServeOptions};
 
 /// Type ASCII through the virtual keyboard; anything else through the
 /// clipboard and Ctrl+V, which needs the session's Wayland or X socket.
+/// A backend that [types Unicode](Backend::types_unicode) gets the whole
+/// text in one request.
 pub fn type_text(c: &dyn Backend, text: &str) -> Result<()> {
-    if text.is_ascii() {
+    if text.is_ascii() || c.types_unicode() {
         c.call(&Request::Type {
             text: text.to_string(),
             delay_ms: None,

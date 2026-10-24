@@ -30,6 +30,14 @@ pub trait Backend: Send + Sync {
         self.call(req)
     }
 
+    /// Whether `Request::Type` takes any Unicode text. When true,
+    /// [`crate::type_text`] sends the whole string in one request instead of
+    /// pasting the non-ASCII runs through the clipboard. cuad's US keymap
+    /// says no; an X server can bind a spare keycode to any keysym.
+    fn types_unicode(&self) -> bool {
+        false
+    }
+
     /// Text for `get_focused`. `None` (the default) falls back to AT-SPI
     /// when the `atspi` feature is on, and to an "unavailable" error when it
     /// is off.

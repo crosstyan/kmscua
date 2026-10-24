@@ -57,6 +57,7 @@ crates/cuad    root daemon
                keymap.rs    US layout and xdotool key names
                recorder.rs  fixed-rate frame loop into a gst-launch child, MP4 out
                server.rs    unix socket loop + capture worker thread
+crates/xcua    the same tools over X11 in one unprivileged process (Xvfb, XTEST, no cuad)
 crates/cua     client; also the library kmscua_mcp (feature `atspi`, default on)
                main.rs      CLI
                lib.rs       serve_stdio, typing with clipboard fallback, doctor
@@ -198,6 +199,29 @@ claude mcp add kmscua-virtual -e KMSCUA_SOCKET=$KMSCUA_SOCKET -e WAYLAND_DISPLAY
 Input devices are routed by udev seat, so the real session never sees the agent's
 keyboard. Design, the two Jetson quirks (5.18 vkms sources on a 5.15 tree, a libseat
 `O_NONBLOCK` shim) and limits: [docs/virtual-desktop.md](docs/virtual-desktop.md).
+
+## Sandboxes without a GPU (xcua)
+
+`xcua` serves the same MCP tools from one unprivileged process with no daemon and no
+socket of its own: it owns an Xvfb (or attaches to an X server that answers), captures
+the root window with `GetImage` (MIT-SHM through a memfd with `--shm`), composites the
+XFIXES cursor, and injects input through XTEST. It links no libxcb and builds as a
+static musl binary, for agent cells with no GPU, DRM, uinput or listening ports, and for
+bwrap sandboxes.
+
+```
+xcua up [--size 1920x1080]          # attach, or start Xvfb; writes DISPLAY=:N to the env file
+. ~/.local/state/xcua/env && xterm & # apps the agent starts read the env file
+claude mcp add xcua -- xcua mcp      # auto-ups if nothing answers
+xcua screenshot -o shot.png | doctor | status | down
+```
+
+An Xvfb started by `xcua up` stays until `xcua down`; one that `xcua mcp` had to start
+stops when that `mcp` exits. State (env file, pidfile, owner, Xvfb log, recordings)
+lives in `--state-dir`, default `$XDG_STATE_HOME/xcua`. With no window manager, every
+click gives the window under the pointer the keyboard. `type` takes any Unicode text:
+characters outside the keymap are bound to a spare keycode for the request (xdotool's
+trick), so no clipboard tool is needed. Recordings are JPEG stills, not MP4.
 
 ## Limitations
 
