@@ -16,7 +16,6 @@
 //! of that.
 
 // main.rs wires this in once the X11 backend lands.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
